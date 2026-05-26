@@ -717,3 +717,129 @@ class TestCreateSymlink:
             assert (target / "Solo Show" / "Solo.Video.mkv").is_symlink()
         finally:
             mc.TYPE_DIRS.update(orig_type_dirs)
+
+
+class TestShowNameNormalization:
+    """Regression: mc-pw3 — duplicate show dirs from inconsistent normalization."""
+
+    def test_normalize_key_collapses_case_punct_year_amp(self):
+        keys = {
+            mc._normalize_show_key("Law and Order SVU"),
+            mc._normalize_show_key("Law And Order SVU"),
+            mc._normalize_show_key("Law and Order SVU 1999"),
+            mc._normalize_show_key("Law & Order SVU (1999)"),
+        }
+        assert len(keys) == 1, f"expected all keys to match, got {keys}"
+
+    def test_canonical_show_dir_reuses_existing(self, tmp_path):
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        (target / "Breaking Bad (2008)").mkdir()
+
+        # Different release-style names should map to the existing dir
+        assert mc._canonical_show_dir(target, "Breaking Bad") == "Breaking Bad (2008)"
+        assert mc._canonical_show_dir(target, "breaking.bad.2008") == "Breaking Bad (2008)"
+
+    def test_canonical_show_dir_keeps_new_when_no_match(self, tmp_path):
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        (target / "The Wire").mkdir()
+        assert mc._canonical_show_dir(target, "Better Call Saul") == "Better Call Saul"
+
+    def test_canonical_show_dir_uses_aliases(self, tmp_path):
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        orig = mc.SHOW_ALIASES.copy()
+        mc.SHOW_ALIASES.clear()
+        mc.SHOW_ALIASES["Law and Order SVU"] = "Law & Order Special Victims Unit (1999)"
+        try:
+            # Direct hit
+            assert mc._canonical_show_dir(target, "Law and Order SVU") == "Law & Order Special Victims Unit (1999)"
+            # Normalized variant of alias key
+            assert mc._canonical_show_dir(target, "Law.And.Order.SVU") == "Law & Order Special Victims Unit (1999)"
+        finally:
+            mc.SHOW_ALIASES.clear()
+            mc.SHOW_ALIASES.update(orig)
+
+    def test_duplicate_dirs_collapse_into_one(self, tmp_path):
+        """The actual SVU bug: three release-style variants must land in one dir."""
+        # First episode arrives — creates the canonical dir
+        first_show = tmp_path / "Law & Order Special Victims Unit (1999)"
+        first_season = first_show / "Season 6"
+        first_season.mkdir(parents=True)
+        first_video = first_season / "Law & Order Special Victims Unit (1999) - S06E14 - Game.mkv"
+        first_video.write_text("v")
+
+        # Subsequent episodes arrive with different release-style names
+        second_show = tmp_path / "Law and Order SVU Season 13 Complete  WEB x264 [i_c]"
+        second_show.mkdir()
+        second_video = second_show / "Law and Order SVU s13e18 - Valentine's Day.mkv"
+        second_video.write_text("v")
+
+        third_show = tmp_path / "Law.And.Order.SVU.S24.COMPLETE.720p.AMZN.WEBRip.x264-GalaxyTV[TGx]"
+        third_show.mkdir()
+        third_video = third_show / "Law.And.Order.SVU.S24E22.720p.AMZN.WEBRip.x264-GalaxyTV.mkv"
+        third_video.write_text("v")
+
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        # Pre-create the canonical dir so the normalizer has something to match against
+        (target / "Law & Order Special Victims Unit (1999)" / "Season 6").mkdir(parents=True)
+
+        orig_type_dirs = mc.TYPE_DIRS.copy()
+        orig_aliases = mc.SHOW_ALIASES.copy()
+        mc.TYPE_DIRS["tv"] = target
+        # Alias handles the SVU↔Special Victims Unit abbreviation
+        mc.SHOW_ALIASES.clear()
+        mc.SHOW_ALIASES["Law and Order SVU"] = "Law & Order Special Victims Unit (1999)"
+        try:
+            assert mc.create_symlink(str(first_video), "tv") is True
+            assert mc.create_symlink(str(second_video), "tv") is True
+            assert mc.create_symlink(str(third_video), "tv") is True
+
+            show_dirs = sorted(p.name for p in target.iterdir() if p.is_dir())
+            assert show_dirs == ["Law & Order Special Victims Unit (1999)"], show_dirs
+        finally:
+            mc.TYPE_DIRS.update(orig_type_dirs)
+            mc.SHOW_ALIASES.clear()
+            mc.SHOW_ALIASES.update(orig_aliases)
+
+    def test_punct_and_case_variants_collapse_without_alias(self, tmp_path):
+        """No alias needed for pure case/punctuation/year differences."""
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        (target / "Breaking Bad (2008)").mkdir()
+
+        # Source 1: parent dir uses dots and no year
+        src1 = tmp_path / "Breaking.Bad.S01"
+        src1.mkdir()
+        v1 = src1 / "Breaking.Bad.S01E01.mkv"
+        v1.write_text("v")
+
+        # Source 2: parent dir uses different casing and year
+        src2 = tmp_path / "breaking bad 2008"
+        src2.mkdir()
+        v2 = src2 / "breaking.bad.S02E01.mkv"
+        v2.write_text("v")
+
+        orig_type_dirs = mc.TYPE_DIRS.copy()
+        mc.TYPE_DIRS["tv"] = target
+        try:
+            assert mc.create_symlink(str(v1), "tv") is True
+            assert mc.create_symlink(str(v2), "tv") is True
+            show_dirs = sorted(p.name for p in target.iterdir() if p.is_dir())
+            assert show_dirs == ["Breaking Bad (2008)"], show_dirs
+        finally:
+            mc.TYPE_DIRS.update(orig_type_dirs)
+
+    def test_load_config_show_aliases(self, tmp_path):
+        config = {"showAliases": {"Foo": "Foo Bar Baz"}}
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps(config))
+        orig = mc.SHOW_ALIASES.copy()
+        try:
+            mc.load_config(str(config_file))
+            assert mc.SHOW_ALIASES == {"Foo": "Foo Bar Baz"}
+        finally:
+            mc.SHOW_ALIASES.clear()
+            mc.SHOW_ALIASES.update(orig)

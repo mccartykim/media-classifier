@@ -39,6 +39,11 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:0.6b")
 CLASSIFIER_VERSION = 2
 CACHE_TTL_DAYS = 30
 
+# Manual aliases for shows whose folder names vary too widely for normalization
+# alone (abbreviations, alternate titles). Map any raw or normalized form to a
+# canonical folder name. Keys are matched case-insensitively after normalization.
+SHOW_ALIASES = {}
+
 TYPE_DIRS = {
     "movie": MEDIA_BASE / "Movies",
     "tv": MEDIA_BASE / "TV Shows",
@@ -83,7 +88,7 @@ def has_tv_pattern(name):
 
 def load_config(config_path):
     """Load JSON config file and apply settings to globals."""
-    global SOURCE_DIRS, MEDIA_BASE, TYPE_DIRS, OLLAMA_HOST, OLLAMA_MODEL, FFPROBE_PATH
+    global SOURCE_DIRS, MEDIA_BASE, TYPE_DIRS, OLLAMA_HOST, OLLAMA_MODEL, FFPROBE_PATH, SHOW_ALIASES
 
     with open(config_path) as f:
         cfg = json.load(f)
@@ -106,6 +111,8 @@ def load_config(config_path):
         OLLAMA_MODEL = cfg["ollamaModel"]
     if "ffprobePath" in cfg:
         FFPROBE_PATH = cfg["ffprobePath"]
+    if "showAliases" in cfg:
+        SHOW_ALIASES = dict(cfg["showAliases"])
 
 
 # =============================================================================
@@ -929,6 +936,90 @@ def _clean_show_name(name):
     return cleaned if cleaned else name
 
 
+# Release tokens that mark the boundary between show title and release info.
+# When found in a normalized key, everything from that token onward is dropped.
+_RELEASE_BOUNDARY_TOKENS = (
+    "season", "complete", "bluray", "blu ray", "web dl", "webdl", "webrip",
+    "hdtv", "dvdrip", "hdrip", "brrip", "amzn", "nf", "hmax", "atvp",
+    "x264", "x265", "h264", "h265", "hevc", "xvid", "aac", "ac3",
+    "1080p", "720p", "480p", "2160p", "4k",
+)
+
+
+def _normalize_show_key(name):
+    """Produce a comparison key for show-name dedup.
+
+    Collapses case, '&'/'and', year suffixes, punctuation, and trailing
+    release-tag noise so that 'Law & Order Special Victims Unit (1999)' and
+    'Law and Order SVU Season 13 Complete WEB x264' collapse to comparable
+    forms (modulo abbreviations, which SHOW_ALIASES handles).
+    """
+    if not name:
+        return ""
+    s = name.lower()
+    s = s.replace("&", " and ")
+    # Strip parenthesized or bare 4-digit years
+    s = re.sub(r"\((?:19|20)\d{2}\)", " ", s)
+    s = re.sub(r"\b(?:19|20)\d{2}\b", " ", s)
+    # Strip S01/S01-S05/SxxExx tokens
+    s = re.sub(r"\bs\d{1,2}(?:[-e]s?\d{1,3})?\b", " ", s)
+    # Replace any non-alphanumeric with space
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = " ".join(s.split())
+    # Cut at first release-boundary token so trailing release info doesn't
+    # poison the key. Keep everything before it as the title.
+    for tok in _RELEASE_BOUNDARY_TOKENS:
+        idx = s.find(f" {tok} ")
+        if s.startswith(f"{tok} "):
+            idx = 0
+        if s.endswith(f" {tok}"):
+            end_idx = len(s) - len(tok) - 1
+            if idx == -1 or end_idx < idx:
+                idx = end_idx
+        if idx == 0:
+            s = ""
+            break
+        if idx > 0:
+            s = s[:idx].strip()
+    return " ".join(s.split())
+
+
+def _canonical_show_dir(target_dir, candidate):
+    """Map a candidate show folder name to a canonical name.
+
+    Applies SHOW_ALIASES first (so abbreviations like 'SVU' resolve), then
+    checks for an existing directory in target_dir whose normalized key
+    matches the candidate's — if so, reuses that name. Otherwise returns
+    the candidate unchanged.
+    """
+    if not candidate:
+        return candidate
+
+    key = _normalize_show_key(candidate)
+
+    # Alias lookup: keys may be raw strings or normalized keys
+    if SHOW_ALIASES:
+        if candidate in SHOW_ALIASES:
+            return SHOW_ALIASES[candidate]
+        for alias_src, alias_dst in SHOW_ALIASES.items():
+            if _normalize_show_key(alias_src) == key:
+                return alias_dst
+
+    # Existing-dir lookup
+    try:
+        existing = [p.name for p in target_dir.iterdir() if p.is_dir()]
+    except (FileNotFoundError, NotADirectoryError):
+        existing = []
+
+    for name in existing:
+        if name == candidate:
+            return candidate
+        if _normalize_show_key(name) == key:
+            return name
+
+    return candidate
+
+
 def create_symlink(source, media_type):
     """Create a symlink in the appropriate Jellyfin media directory.
 
@@ -954,6 +1045,7 @@ def create_symlink(source, media_type):
     if media_type in ("tv", "anime"):
         show_name, season_num = _infer_show_folder(source)
         if show_name:
+            show_name = _canonical_show_dir(target_dir, show_name)
             show_dir = target_dir / show_name
             if season_num is not None:
                 dest_dir = show_dir / f"Season {season_num}"
