@@ -1922,3 +1922,222 @@ class TestMergeEpisodeDuplicates:
             assert len(data["groups"][0]["unlinked"]) == 1
         finally:
             restore()
+
+
+class TestLLMShowVerification:
+    """mc-5mc: LLM verification when creating a new top-level show dir."""
+
+    def test_fuzzy_similarity_triggers_llm(self, tmp_path):
+        """When a sibling has token_set_ratio >= 60, LLM is consulted."""
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        (target / "Sousou no Frieren").mkdir()
+
+        with mock.patch.object(mc, "_fuzzy_similar_siblings", return_value=["Sousou no Frieren"]) as mock_fuzz, \
+             mock.patch.object(mc, "_llm_verify_new_show", return_value="Sousou no Frieren") as mock_llm:
+            result = mc._canonical_show_dir(target, "Frieren")
+            mock_fuzz.assert_called_once()
+            mock_llm.assert_called_once_with("Frieren", ["Sousou no Frieren"])
+            assert result == "Sousou no Frieren"
+
+    def test_no_similar_siblings_skips_llm(self, tmp_path):
+        """When no sibling is similar enough, LLM is not called."""
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        (target / "Breaking Bad (2008)").mkdir()
+
+        with mock.patch.object(mc, "_llm_verify_new_show", return_value="Breaking Bad (2008)") as mock_llm:
+            result = mc._canonical_show_dir(target, "The Wire")
+            mock_llm.assert_not_called()
+            assert result == "The Wire"
+
+    def test_no_existing_dirs_skips_llm(self, tmp_path):
+        """When TYPE_DIR has no sibling dirs, LLM is not called."""
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+
+        with mock.patch.object(mc, "_llm_verify_new_show", return_value="anything") as mock_llm:
+            result = mc._canonical_show_dir(target, "Frieren")
+            mock_llm.assert_not_called()
+            assert result == "Frieren"
+
+    def test_llm_match_reuses_sibling(self, tmp_path):
+        """LLM MATCH result reuses the sibling's exact dir name."""
+        target = tmp_path / "Anime"
+        target.mkdir()
+        (target / "Sousou no Frieren").mkdir()
+
+        cache_file = tmp_path / "cache.json"
+        review_log = tmp_path / "review.log"
+
+        with mock.patch.object(mc, "LLM_SHOW_CACHE_FILE", cache_file), \
+             mock.patch.object(mc, "NEEDS_CLASSIFY_REVIEW_LOG", review_log), \
+             mock.patch.object(mc, "OLLAMA_HOST", "http://localhost:11434"), \
+             mock.patch.object(mc, "OLLAMA_MODEL", "test-model"), \
+             mock.patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({
+                "response": "MATCH 1",
+            }).encode()
+            mock_resp.__enter__ = lambda s: mock_resp
+            mock_resp.__exit__ = mock.MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_resp
+
+            result = mc._llm_verify_new_show("Frieren", ["Sousou no Frieren"])
+            assert result == "Sousou no Frieren"
+
+    def test_llm_new_proceeds_with_candidate(self, tmp_path):
+        """LLM NEW result returns the original candidate."""
+        cache_file = tmp_path / "cache.json"
+        review_log = tmp_path / "review.log"
+
+        with mock.patch.object(mc, "LLM_SHOW_CACHE_FILE", cache_file), \
+             mock.patch.object(mc, "NEEDS_CLASSIFY_REVIEW_LOG", review_log), \
+             mock.patch.object(mc, "OLLAMA_HOST", "http://localhost:11434"), \
+             mock.patch.object(mc, "OLLAMA_MODEL", "test-model"), \
+             mock.patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({
+                "response": "NEW",
+            }).encode()
+            mock_resp.__enter__ = lambda s: mock_resp
+            mock_resp.__exit__ = mock.MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_resp
+
+            result = mc._llm_verify_new_show("Frieren", ["Sousou no Frieren"])
+            assert result == "Frieren"
+
+    def test_llm_failure_falls_through_to_new(self, tmp_path):
+        """When LLM is unreachable, falls through to NEW and logs to review log."""
+        cache_file = tmp_path / "cache.json"
+        review_log = tmp_path / "review.log"
+
+        with mock.patch.object(mc, "LLM_SHOW_CACHE_FILE", cache_file), \
+             mock.patch.object(mc, "NEEDS_CLASSIFY_REVIEW_LOG", review_log), \
+             mock.patch.object(mc, "OLLAMA_HOST", "http://localhost:11434"), \
+             mock.patch.object(mc, "OLLAMA_MODEL", "test-model"), \
+             mock.patch("urllib.request.urlopen", side_effect=Exception("connection refused")):
+            result = mc._llm_verify_new_show("Frieren", ["Sousou no Frieren"])
+            assert result == "Frieren"
+            assert review_log.exists()
+            content = review_log.read_text()
+            assert "llm_error" in content
+            assert "Frieren" in content
+
+    def test_llm_unparseable_response_falls_through(self, tmp_path):
+        """Unparseable LLM response falls through to NEW and logs."""
+        cache_file = tmp_path / "cache.json"
+        review_log = tmp_path / "review.log"
+
+        with mock.patch.object(mc, "LLM_SHOW_CACHE_FILE", cache_file), \
+             mock.patch.object(mc, "NEEDS_CLASSIFY_REVIEW_LOG", review_log), \
+             mock.patch.object(mc, "OLLAMA_HOST", "http://localhost:11434"), \
+             mock.patch.object(mc, "OLLAMA_MODEL", "test-model"), \
+             mock.patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({
+                "response": "I think it's the same show",
+            }).encode()
+            mock_resp.__enter__ = lambda s: mock_resp
+            mock_resp.__exit__ = mock.MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_resp
+
+            result = mc._llm_verify_new_show("Frieren", ["Sousou no Frieren"])
+            assert result == "Frieren"
+            assert review_log.exists()
+            content = review_log.read_text()
+            assert "llm_unparseable" in content
+
+    def test_cache_hit_avoids_llm_call(self, tmp_path):
+        """Cache hit returns stored decision without calling LLM."""
+        cache_file = tmp_path / "cache.json"
+        review_log = tmp_path / "review.log"
+        cache_file.write_text(json.dumps({
+            "frieren|sousou no frieren": {"verdict": "MATCH", "match_name": "Sousou no Frieren"},
+        }))
+
+        with mock.patch.object(mc, "LLM_SHOW_CACHE_FILE", cache_file), \
+             mock.patch.object(mc, "NEEDS_CLASSIFY_REVIEW_LOG", review_log), \
+             mock.patch("urllib.request.urlopen") as mock_urlopen:
+            result = mc._llm_verify_new_show("Frieren", ["Sousou no Frieren"])
+            mock_urlopen.assert_not_called()
+            assert result == "Sousou no Frieren"
+
+    def test_cache_new_hit_returns_candidate(self, tmp_path):
+        """Cache hit with NEW verdict returns candidate unchanged."""
+        cache_file = tmp_path / "cache.json"
+        review_log = tmp_path / "review.log"
+        cache_file.write_text(json.dumps({
+            "the wire|breaking bad 2008": {"verdict": "NEW"},
+        }))
+
+        with mock.patch.object(mc, "LLM_SHOW_CACHE_FILE", cache_file), \
+             mock.patch.object(mc, "NEEDS_CLASSIFY_REVIEW_LOG", review_log):
+            result = mc._llm_verify_new_show("The Wire", ["Breaking Bad (2008)"])
+            assert result == "The Wire"
+
+    def test_llm_match_out_of_range_falls_through(self, tmp_path):
+        """MATCH with out-of-range index falls through to NEW."""
+        cache_file = tmp_path / "cache.json"
+        review_log = tmp_path / "review.log"
+
+        with mock.patch.object(mc, "LLM_SHOW_CACHE_FILE", cache_file), \
+             mock.patch.object(mc, "NEEDS_CLASSIFY_REVIEW_LOG", review_log), \
+             mock.patch.object(mc, "OLLAMA_HOST", "http://localhost:11434"), \
+             mock.patch.object(mc, "OLLAMA_MODEL", "test-model"), \
+             mock.patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({
+                "response": "MATCH 5",
+            }).encode()
+            mock_resp.__enter__ = lambda s: mock_resp
+            mock_resp.__exit__ = mock.MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_resp
+
+            result = mc._llm_verify_new_show("Frieren", ["Sousou no Frieren"])
+            assert result == "Frieren"
+            assert review_log.exists()
+
+    def test_exact_normalized_match_skips_llm(self, tmp_path):
+        """When an exact normalized-key match exists, LLM is not called."""
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        (target / "Breaking Bad (2008)").mkdir()
+
+        with mock.patch.object(mc, "_llm_verify_new_show", return_value="should not be called") as mock_llm:
+            result = mc._canonical_show_dir(target, "breaking.bad.2008")
+            mock_llm.assert_not_called()
+            assert result == "Breaking Bad (2008)"
+
+    def test_alias_match_skips_llm(self, tmp_path):
+        """When an alias matches, LLM is not called."""
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        orig = mc.SHOW_ALIASES.copy()
+        mc.SHOW_ALIASES.clear()
+        mc.SHOW_ALIASES["Law and Order SVU"] = "Law & Order Special Victims Unit (1999)"
+        try:
+            with mock.patch.object(mc, "_llm_verify_new_show", return_value="should not be called") as mock_llm:
+                result = mc._canonical_show_dir(target, "Law and Order SVU")
+                mock_llm.assert_not_called()
+                assert result == "Law & Order Special Victims Unit (1999)"
+        finally:
+            mc.SHOW_ALIASES.clear()
+            mc.SHOW_ALIASES.update(orig)
+
+    def test_multiple_similar_siblings_passed_to_llm(self, tmp_path):
+        """All siblings with token_set_ratio >= 60 are passed to LLM."""
+        target = tmp_path / "Anime"
+        target.mkdir()
+        (target / "Sousou no Frieren").mkdir()
+        (target / "Frieren Beyond Journey's End").mkdir()
+        (target / "Attack on Titan").mkdir()
+
+        similar = ["Sousou no Frieren", "Frieren Beyond Journey's End"]
+        with mock.patch.object(mc, "_fuzzy_similar_siblings", return_value=similar) as mock_fuzz, \
+             mock.patch.object(mc, "_llm_verify_new_show", return_value="Frieren") as mock_llm:
+            mc._canonical_show_dir(target, "Frieren")
+            called_siblings = mock_llm.call_args[0][1]
+            assert "Sousou no Frieren" in called_siblings
+            assert "Frieren Beyond Journey's End" in called_siblings
+            assert "Attack on Titan" not in called_siblings

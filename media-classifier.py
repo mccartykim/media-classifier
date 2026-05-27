@@ -995,6 +995,16 @@ def _normalize_show_key(name):
     return " ".join(s.split())
 
 
+def _fuzzy_similar_siblings(candidate, existing, threshold=60):
+    """Return siblings whose name is similar to candidate (token_set_ratio >= threshold).
+
+    Returns an empty list if rapidfuzz is unavailable.
+    """
+    if rf_fuzz is None:
+        return []
+    return [name for name in existing if rf_fuzz.token_set_ratio(candidate, name) >= threshold]
+
+
 def _load_llm_show_cache():
     """Load the LLM show-verification cache from disk."""
     try:
@@ -1110,8 +1120,9 @@ def _canonical_show_dir(target_dir, candidate):
 
     Applies SHOW_ALIASES first (so abbreviations like 'SVU' resolve), then
     checks for an existing directory in target_dir whose normalized key
-    matches the candidate's — if so, reuses that name. Otherwise returns
-    the candidate unchanged.
+    matches the candidate's — if so, reuses that name. If no exact match,
+    checks for fuzzy-similar siblings and asks the LLM whether candidate
+    is actually one of them. Otherwise returns the candidate unchanged.
     """
     if not candidate:
         return candidate
@@ -1137,6 +1148,16 @@ def _canonical_show_dir(target_dir, candidate):
             return candidate
         if _normalize_show_key(name) == key:
             return name
+
+    # No exact normalized-key match found.
+    # If there are similar-looking siblings, ask the LLM whether this is
+    # actually one of them (catches anime aliases like Frieren vs Sousou no Frieren).
+    if existing:
+        similar = _fuzzy_similar_siblings(candidate, existing)
+        if similar:
+            result = _llm_verify_new_show(candidate, similar)
+            if result != candidate:
+                return result
 
     return candidate
 
