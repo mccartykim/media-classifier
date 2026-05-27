@@ -12,11 +12,17 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    from rapidfuzz import fuzz as rf_fuzz
+except ImportError:
+    rf_fuzz = None
 
 try:
     import anitopy
@@ -39,6 +45,10 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:0.6b")
 
 CLASSIFIER_VERSION = 2
 CACHE_TTL_DAYS = 30
+
+LLM_SHOW_CACHE_FILE = STATE_DIR / "llm_show_cache.json"
+NEEDS_CLASSIFY_REVIEW_LOG = STATE_DIR / "needs-classify-review.log"
+_llm_show_lock = threading.Lock()
 
 # Manual aliases for shows whose folder names vary too widely for normalization
 # alone (abbreviations, alternate titles). Map any raw or normalized form to a
@@ -983,6 +993,116 @@ def _normalize_show_key(name):
         if idx > 0:
             s = s[:idx].strip()
     return " ".join(s.split())
+
+
+def _load_llm_show_cache():
+    """Load the LLM show-verification cache from disk."""
+    try:
+        if LLM_SHOW_CACHE_FILE.exists():
+            with open(LLM_SHOW_CACHE_FILE) as f:
+                return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _save_llm_show_cache(cache):
+    """Persist the LLM show-verification cache to disk."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LLM_SHOW_CACHE_FILE, "w") as f:
+            json.dump(cache, f, indent=2)
+    except OSError:
+        pass
+
+
+def _log_needs_review(candidate, siblings, reason):
+    """Append a line to needs-classify-review.log when LLM verification fails."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat()
+        line = f"[{ts}] candidate={candidate!r} siblings={siblings!r} reason={reason}\n"
+        with open(NEEDS_CLASSIFY_REVIEW_LOG, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def _llm_verify_new_show(candidate, siblings):
+    """Ask the LLM whether candidate is actually one of the existing sibling shows.
+
+    Returns the sibling name to reuse (MATCH N) or the original candidate (NEW).
+    On LLM failure, logs to needs-classify-review.log and returns candidate unchanged.
+    """
+    # Build cache key: (normalized-candidate, sorted-tuple-of-sibling-normalized-keys)
+    cand_key = _normalize_show_key(candidate)
+    sib_keys = tuple(sorted(_normalize_show_key(s) for s in siblings))
+    cache_key = f"{cand_key}|{'|'.join(sib_keys)}"
+
+    cache = _load_llm_show_cache()
+    if cache_key in cache:
+        decision = cache[cache_key]
+        if decision.get("verdict") == "MATCH" and decision.get("match_name") in siblings:
+            return decision["match_name"]
+        # NEW or stale cache (sibling list changed) → return candidate
+        return candidate
+
+    # Build prompt
+    sibling_lines = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(siblings))
+    prompt = (
+        "You are a media library deduplicator. A new file is about to be classified "
+        f'as a NEW show called "{candidate}". The following existing shows in the '
+        "same library type have similar-looking names:\n\n"
+        f"{sibling_lines}\n\n"
+        "Is the new show actually one of the existing entries? Reply with EXACTLY "
+        "one line:\n"
+        '  MATCH <number>    if it is the same show as that entry (e.g., "MATCH 2")\n'
+        "  NEW              if it is a different show\n\n"
+        "If unsure, reply NEW. Do not invent shows that are not in the list."
+    )
+
+    with _llm_show_lock:
+        try:
+            payload = json.dumps({
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.1, "num_predict": 30},
+            }).encode()
+            req = urllib.request.Request(
+                f"{OLLAMA_HOST}/api/generate",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            text = data.get("response", "").strip()
+        except Exception as e:
+            _log_needs_review(candidate, siblings, f"llm_error: {e}")
+            return candidate
+
+    # Parse response
+    match = re.match(r"^MATCH\s+(\d+)\s*$", text, re.IGNORECASE)
+    if match:
+        idx = int(match.group(1)) - 1  # 1-indexed in prompt
+        if 0 <= idx < len(siblings):
+            cache[cache_key] = {"verdict": "MATCH", "match_name": siblings[idx]}
+            _save_llm_show_cache(cache)
+            return siblings[idx]
+        # Out-of-range index → log and fall through
+        _log_needs_review(candidate, siblings, f"llm_match_index_out_of_range: {text!r}")
+        cache[cache_key] = {"verdict": "NEW"}
+        _save_llm_show_cache(cache)
+        return candidate
+
+    if text.upper().startswith("NEW"):
+        cache[cache_key] = {"verdict": "NEW"}
+        _save_llm_show_cache(cache)
+        return candidate
+
+    # Unparseable response
+    _log_needs_review(candidate, siblings, f"llm_unparseable: {text!r}")
+    return candidate
 
 
 def _canonical_show_dir(target_dir, candidate):
