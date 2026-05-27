@@ -1574,6 +1574,330 @@ def _print_merge_report(report):
         print("\n(dry-run — pass --apply to execute)")
 
 
+# =============================================================================
+# Phase 3: episode-level dedup (--report-episode-dupes / --merge-episode-dupes)
+# =============================================================================
+
+# Captures (season, episode) from an SxxEyy-style token at a delimiter boundary.
+_EPISODE_TOKEN_RE = re.compile(r"(?:^|[.\s/_-])S(\d{1,2})E(\d{1,3})", re.IGNORECASE)
+
+# In-memory ffprobe cache, keyed by (resolved_path, mtime_ns).
+_EPISODE_PROBE_CACHE = {}
+
+
+def _parse_episode_key(filename, season_hint=None):
+    """Extract (season, episode) ints from a filename, or None if unrecognised.
+
+    SxxEyy match wins. Falls back to anitopy when present (e.g. anime files that
+    carry only an episode number); ``season_hint`` (from the enclosing Season N
+    directory) fills in the season when anitopy can't.
+    """
+    m = _EPISODE_TOKEN_RE.search(filename)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    if anitopy:
+        try:
+            parsed = anitopy.parse(filename)
+        except Exception:
+            return None
+        ep_raw = parsed.get("episode_number")
+        sn_raw = parsed.get("anime_season")
+        try:
+            ep_n = int(ep_raw) if ep_raw is not None else None
+        except (TypeError, ValueError):
+            ep_n = None
+        try:
+            sn_n = int(sn_raw) if sn_raw is not None else None
+        except (TypeError, ValueError):
+            sn_n = None
+        if ep_n is not None:
+            if sn_n is None:
+                sn_n = season_hint
+            if sn_n is not None:
+                return (sn_n, ep_n)
+    return None
+
+
+def _episode_probe(target_path):
+    """Probe a media file for (height, has_subs, size, mtime). Cached.
+
+    Cache key is (path, mtime_ns) so re-encodes invalidate. Returns None when
+    the target is missing or ffprobe fails — callers must tolerate this and
+    treat unknown signals as zero.
+    """
+    target_path = Path(target_path)
+    try:
+        st = target_path.stat()
+    except OSError:
+        return None
+    key = (str(target_path), st.st_mtime_ns)
+    if key in _EPISODE_PROBE_CACHE:
+        return _EPISODE_PROBE_CACHE[key]
+
+    info = {
+        "height": 0,
+        "has_subs": False,
+        "sub_count": 0,
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+    }
+    try:
+        result = subprocess.run(
+            [
+                FFPROBE_PATH, "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                str(target_path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout or "{}")
+            for s in data.get("streams", []):
+                t = s.get("codec_type")
+                if t == "video":
+                    try:
+                        h = int(s.get("height") or 0)
+                    except (TypeError, ValueError):
+                        h = 0
+                    if h > info["height"]:
+                        info["height"] = h
+                elif t == "subtitle":
+                    info["sub_count"] += 1
+            info["has_subs"] = info["sub_count"] > 0
+    except Exception:
+        pass
+
+    _EPISODE_PROBE_CACHE[key] = info
+    return info
+
+
+def _external_subs_present(link_path):
+    """True iff a subtitle file sits beside the symlink or beside its target.
+
+    Matches the stem-prefix rule used by ``_link_companion_subs``.
+    """
+    link_path = Path(link_path)
+    stem = link_path.stem
+    try:
+        for p in link_path.parent.iterdir():
+            if p == link_path:
+                continue
+            if p.suffix.lower() in SUBTITLE_EXTENSIONS and p.stem.startswith(stem):
+                return True
+    except OSError:
+        pass
+    try:
+        target = link_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    try:
+        for p in target.parent.iterdir():
+            if p.suffix.lower() in SUBTITLE_EXTENSIONS and p.stem.startswith(target.stem):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _pick_episode_winner(links, prefer_release_group=None):
+    """Pick which symlink to keep for one (season, episode) group.
+
+    Priority (each beats everything below it): subtitle presence (internal +
+    external) > video height > prefer-release-group regex hit > target file
+    size > target mtime > filename (lexical ascending).
+
+    Returns ``(winner, [losers])``.
+    """
+    prefer_re = (
+        re.compile(prefer_release_group, re.IGNORECASE)
+        if prefer_release_group else None
+    )
+
+    def score(link):
+        probe = _episode_probe(link) or {}
+        subs = (1 if probe.get("has_subs") else 0) + (
+            1 if _external_subs_present(link) else 0
+        )
+        height = int(probe.get("height") or 0)
+        size = int(probe.get("size") or 0)
+        mtime = float(probe.get("mtime") or 0.0)
+        group_match = 1 if (prefer_re and prefer_re.search(link.name)) else 0
+        return (subs, height, group_match, size, mtime)
+
+    # Stable two-pass sort: name ascending first, then score descending —
+    # ties on score fall through to name in ascending order.
+    by_name = sorted(links, key=lambda l: l.name)
+    ranked = sorted(by_name, key=score, reverse=True)
+    return ranked[0], ranked[1:]
+
+
+def _scan_episode_dupes():
+    """Walk TYPE_DIRS/<show>/<season>/ and return groups with >1 symlink per
+    (season, episode). Each entry is a dict with type/show/season/episode/links.
+    """
+    out = []
+    for type_name, type_dir in TYPE_DIRS.items():
+        if not type_dir.is_dir():
+            continue
+        try:
+            shows = sorted(type_dir.iterdir())
+        except OSError:
+            continue
+        for show_dir in shows:
+            if not show_dir.is_dir():
+                continue
+            try:
+                season_children = sorted(show_dir.iterdir())
+            except OSError:
+                continue
+            for season_dir in season_children:
+                if not season_dir.is_dir() or season_dir.is_symlink():
+                    continue
+                if not _is_season_dir(season_dir.name):
+                    continue
+                season_num = _season_from_dir(season_dir.name)
+                by_ep = {}
+                try:
+                    entries = sorted(season_dir.iterdir())
+                except OSError:
+                    continue
+                for link in entries:
+                    if not link.is_symlink():
+                        continue
+                    if link.suffix.lower() not in MEDIA_EXTENSIONS:
+                        continue
+                    key = _parse_episode_key(link.name, season_hint=season_num)
+                    if key is None:
+                        continue
+                    by_ep.setdefault(key, []).append(link)
+                for (sn, ep), links in sorted(by_ep.items()):
+                    if len(links) > 1:
+                        out.append({
+                            "type": type_name,
+                            "show": show_dir.name,
+                            "season": sn,
+                            "episode": ep,
+                            "links": links,
+                        })
+    return out
+
+
+def report_episode_duplicates(json_output=False, prefer_release_group=None):
+    """Print or emit JSON of episode-level dedup candidates across TYPE_DIRs."""
+    dupes = _scan_episode_dupes()
+    enriched = []
+    for d in dupes:
+        winner, losers = _pick_episode_winner(
+            d["links"], prefer_release_group=prefer_release_group,
+        )
+        enriched.append({**d, "winner": winner, "losers": losers})
+
+    if json_output:
+        payload = [
+            {
+                "type": d["type"],
+                "show": d["show"],
+                "season": d["season"],
+                "episode": d["episode"],
+                "winner": str(d["winner"]),
+                "candidates": [
+                    {
+                        "path": str(l),
+                        "target": (
+                            os.readlink(l) if l.is_symlink() else None
+                        ),
+                        "is_winner": (l == d["winner"]),
+                    }
+                    for l in d["links"]
+                ],
+            }
+            for d in enriched
+        ]
+        print(json.dumps(payload, indent=2))
+        return
+
+    if not enriched:
+        print("No episode-level duplicates found.")
+        return
+
+    by_show = {}
+    for d in enriched:
+        by_show.setdefault((d["type"], d["show"]), []).append(d)
+
+    total_losers = 0
+    for (tname, show), entries in sorted(by_show.items()):
+        print(f"\n=== {tname.upper()}: {show} ===")
+        for d in sorted(entries, key=lambda e: (e["season"], e["episode"])):
+            total_losers += len(d["losers"])
+            print(
+                f"S{d['season']:02d}E{d['episode']:02d}: "
+                f"{len(d['links'])} encodings"
+            )
+            for link in d["links"]:
+                mark = "  ← keep" if link == d["winner"] else ""
+                print(f"  {link.name}{mark}")
+    print(
+        f"\nTotal episode-dupe groups: {len(enriched)}"
+        f"\nSymlinks that would be unlinked: {total_losers}"
+    )
+
+
+def merge_episode_duplicates(*, dry_run=True, prefer_release_group=None,
+                             json_output=False):
+    """Unlink loser symlinks for each (season, episode) dupe group.
+
+    Only the symlinks under TYPE_DIRs are touched — the file each symlink
+    points at is never modified.
+    """
+    dupes = _scan_episode_dupes()
+    report = {"dry_run": dry_run, "groups": [], "unlinked": 0}
+
+    for d in dupes:
+        winner, losers = _pick_episode_winner(
+            d["links"], prefer_release_group=prefer_release_group,
+        )
+        unlinked = []
+        for loser in losers:
+            if not dry_run:
+                try:
+                    loser.unlink()
+                except OSError:
+                    continue
+            unlinked.append(str(loser))
+            report["unlinked"] += 1
+        report["groups"].append({
+            "type": d["type"],
+            "show": d["show"],
+            "season": d["season"],
+            "episode": d["episode"],
+            "winner": str(winner),
+            "unlinked": unlinked,
+        })
+
+    if json_output:
+        print(json.dumps(report, indent=2))
+    else:
+        mode = "DRY-RUN" if dry_run else "APPLY"
+        print(f"=== Merge episode dupes ({mode}) ===")
+        for g in report["groups"]:
+            print(
+                f"\n[{g['type']}] {g['show']} "
+                f"S{g['season']:02d}E{g['episode']:02d}"
+            )
+            print(f"  keep:   {Path(g['winner']).name}")
+            for u in g["unlinked"]:
+                print(f"  unlink: {Path(u).name}")
+        print(
+            f"\nTotal groups: {len(report['groups'])}"
+            f"\nTotal symlinks unlinked: {report['unlinked']}"
+        )
+        if dry_run:
+            print("\n(dry-run — pass --apply to execute)")
+
+    return report
+
+
 def create_symlink(source, media_type):
     """Create a symlink in the appropriate Jellyfin media directory.
 
@@ -1746,6 +2070,34 @@ def main():
         help="Override canonical pick for a group (repeatable). KEY is matched "
              "against the group's normalized show key.",
     )
+    parser.add_argument(
+        "--report-episode-dupes",
+        action="store_true",
+        help="Scan each Season N dir for multiple symlinks of the same SxxEyy and exit.",
+    )
+    parser.add_argument(
+        "--report-episode-dupes-json",
+        action="store_true",
+        help="Like --report-episode-dupes but emit JSON for downstream tooling.",
+    )
+    parser.add_argument(
+        "--merge-episode-dupes",
+        action="store_true",
+        help="Unlink loser symlinks for each (season, episode) dupe group. "
+             "Dry-run by default; pass --apply to execute. Source files untouched.",
+    )
+    parser.add_argument(
+        "--merge-episode-dupes-json",
+        action="store_true",
+        help="Like --merge-episode-dupes but emit JSON instead of a text report.",
+    )
+    parser.add_argument(
+        "--prefer-release-group",
+        metavar="REGEX",
+        help="When picking the episode winner, prefer symlinks whose filename "
+             "matches this regex (e.g. 'AMZN.*WEBRip|x265|ImE'). Beats size/mtime "
+             "but loses to subs presence and video height.",
+    )
     args = parser.parse_args()
 
     if args.config:
@@ -1762,6 +2114,21 @@ def main():
             prefer_year_form=args.prefer_year_form,
             canonical_overrides=args.canonical,
             json_output=args.merge_dupes_json,
+        )
+        return
+
+    if args.report_episode_dupes or args.report_episode_dupes_json:
+        report_episode_duplicates(
+            json_output=args.report_episode_dupes_json,
+            prefer_release_group=args.prefer_release_group,
+        )
+        return
+
+    if args.merge_episode_dupes or args.merge_episode_dupes_json:
+        merge_episode_duplicates(
+            dry_run=not args.apply,
+            prefer_release_group=args.prefer_release_group,
+            json_output=args.merge_episode_dupes_json,
         )
         return
 

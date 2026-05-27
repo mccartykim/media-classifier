@@ -1447,3 +1447,478 @@ class TestMergeDupes:
         p.write_text("aliases: {}\n")
         with pytest.raises(SystemExit):
             mc._load_aliases(str(p))
+
+
+# =============================================================================
+# Phase 3: --report-episode-dupes / --merge-episode-dupes (mc-x2b)
+# =============================================================================
+
+
+class TestParseEpisodeKey:
+    """_parse_episode_key extracts (season, episode) from filenames."""
+
+    def test_standard_sxxeyy(self):
+        assert mc._parse_episode_key("Show.S06E01.AMZN.WEBRip.mkv") == (6, 1)
+
+    def test_anchored_at_start(self):
+        assert mc._parse_episode_key("S01E12.mkv") == (1, 12)
+
+    def test_lowercase(self):
+        assert mc._parse_episode_key("show.s02e05.mkv") == (2, 5)
+
+    def test_three_digit_episode(self):
+        assert mc._parse_episode_key("Show.S01E125.mkv") == (1, 125)
+
+    def test_no_match_returns_none(self):
+        assert mc._parse_episode_key("movie.2022.1080p.mkv") is None
+
+    def test_sxx_only_does_not_match(self):
+        # S01 alone (no E) is a season marker, not an episode key.
+        assert mc._parse_episode_key("Show.S01.Complete.mkv") is None
+
+    def test_anitopy_fallback_uses_season_hint(self):
+        if mc.anitopy is None:
+            pytest.skip("anitopy not installed")
+        # Bare anime episode form — anitopy will extract episode=12,
+        # season comes from the directory hint.
+        result = mc._parse_episode_key(
+            "[SubsPlease] Show - 12 [1080p].mkv", season_hint=3,
+        )
+        assert result == (3, 12)
+
+    def test_anitopy_fallback_without_hint_returns_none(self):
+        if mc.anitopy is None:
+            pytest.skip("anitopy not installed")
+        # No SxxEyy, no season hint, anitopy may extract season=None →
+        # we cannot form a key.
+        result = mc._parse_episode_key(
+            "[SubsPlease] Show - 12 [1080p].mkv", season_hint=None,
+        )
+        assert result is None
+
+
+class TestExternalSubsPresent:
+    """_external_subs_present checks sibling subtitle files by stem-prefix."""
+
+    def test_link_side_subtitle_detected(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        target = src / "ep1.mkv"
+        target.write_text("v")
+        d = tmp_path / "Season 1"
+        d.mkdir()
+        link = d / "Show.S01E01.mkv"
+        link.symlink_to(target)
+        sub = d / "Show.S01E01.en.srt"
+        sub.write_text("subs")
+        assert mc._external_subs_present(link) is True
+
+    def test_target_side_subtitle_detected(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        target = src / "Show.S01E01.mkv"
+        target.write_text("v")
+        (src / "Show.S01E01.en.srt").write_text("subs")
+        d = tmp_path / "Season 1"
+        d.mkdir()
+        link = d / "Show.S01E01.mkv"
+        link.symlink_to(target)
+        assert mc._external_subs_present(link) is True
+
+    def test_no_subs_returns_false(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        target = src / "ep1.mkv"
+        target.write_text("v")
+        d = tmp_path / "Season 1"
+        d.mkdir()
+        link = d / "Show.S01E01.mkv"
+        link.symlink_to(target)
+        assert mc._external_subs_present(link) is False
+
+
+class TestEpisodeProbeCache:
+    """_episode_probe caches by (path, mtime_ns) and degrades cleanly."""
+
+    def test_returns_none_for_missing_file(self, tmp_path):
+        missing = tmp_path / "nope.mkv"
+        assert mc._episode_probe(missing) is None
+
+    def test_cache_hit_avoids_subprocess(self, tmp_path, monkeypatch):
+        f = tmp_path / "v.mkv"
+        f.write_text("v")
+        calls = {"n": 0}
+        real_run = mc.subprocess.run
+
+        def fake_run(*a, **kw):
+            calls["n"] += 1
+            return real_run(["true"], capture_output=True, text=True)
+
+        mc._EPISODE_PROBE_CACHE.clear()
+        monkeypatch.setattr(mc.subprocess, "run", fake_run)
+        mc._episode_probe(f)
+        mc._episode_probe(f)
+        # Second call should hit cache → run invoked exactly once
+        assert calls["n"] == 1
+
+    def test_probe_with_mocked_ffprobe_extracts_height_and_subs(
+        self, tmp_path, monkeypatch,
+    ):
+        f = tmp_path / "v.mkv"
+        f.write_text("v")
+        mc._EPISODE_PROBE_CACHE.clear()
+        payload = json.dumps({
+            "streams": [
+                {"codec_type": "video", "height": 1080},
+                {"codec_type": "audio", "tags": {"language": "eng"}},
+                {"codec_type": "subtitle", "codec_name": "ass"},
+            ],
+        })
+
+        def fake_run(*a, **kw):
+            return type("R", (), {"returncode": 0, "stdout": payload, "stderr": ""})()
+
+        monkeypatch.setattr(mc.subprocess, "run", fake_run)
+        info = mc._episode_probe(f)
+        assert info["height"] == 1080
+        assert info["has_subs"] is True
+        assert info["sub_count"] == 1
+
+
+class TestPickEpisodeWinner:
+    """_pick_episode_winner applies the bead's priority list."""
+
+    def _mk_link(self, tmp_path, name, content="v", season_dir="Season 1"):
+        src = tmp_path / "_src"
+        src.mkdir(exist_ok=True)
+        target = src / f"{name}.target"
+        target.write_text(content)
+        d = tmp_path / season_dir
+        d.mkdir(exist_ok=True)
+        link = d / name
+        link.symlink_to(target)
+        return link
+
+    def _stub_probe(self, monkeypatch, probes):
+        """probes: {filename: dict-with-height/has_subs/size/mtime}."""
+        def fake(link):
+            return probes.get(Path(link).name, {})
+        monkeypatch.setattr(mc, "_episode_probe", fake)
+        monkeypatch.setattr(mc, "_external_subs_present", lambda l: False)
+
+    def test_subs_presence_beats_height(self, tmp_path, monkeypatch):
+        a = self._mk_link(tmp_path, "a.S01E01.mkv")
+        b = self._mk_link(tmp_path, "b.S01E01.mkv")
+        self._stub_probe(monkeypatch, {
+            "a.S01E01.mkv": {"has_subs": True, "height": 720, "size": 1, "mtime": 1},
+            "b.S01E01.mkv": {"has_subs": False, "height": 1080, "size": 100, "mtime": 2},
+        })
+        winner, losers = mc._pick_episode_winner([a, b])
+        assert winner == a
+        assert losers == [b]
+
+    def test_height_beats_release_group_regex(self, tmp_path, monkeypatch):
+        a = self._mk_link(tmp_path, "S01E01.AMZN.WEBRip.mkv")
+        b = self._mk_link(tmp_path, "S01E01.GENERIC.mkv")
+        self._stub_probe(monkeypatch, {
+            "S01E01.AMZN.WEBRip.mkv": {"height": 720, "size": 1, "mtime": 1},
+            "S01E01.GENERIC.mkv":     {"height": 1080, "size": 1, "mtime": 1},
+        })
+        winner, _ = mc._pick_episode_winner([a, b], prefer_release_group="AMZN")
+        assert winner == b  # 1080p wins despite AMZN regex match on the other
+
+    def test_release_group_regex_beats_size(self, tmp_path, monkeypatch):
+        a = self._mk_link(tmp_path, "S06E01.GENERIC.mkv")
+        b = self._mk_link(tmp_path, "Law.Order.SVU.S06E01.AMZN.WEBRip.x265.ImE.mkv")
+        # Equal height. Regex hit on b wins despite a being larger.
+        self._stub_probe(monkeypatch, {
+            "S06E01.GENERIC.mkv":
+                {"height": 1080, "size": 5_000_000_000, "mtime": 1},
+            "Law.Order.SVU.S06E01.AMZN.WEBRip.x265.ImE.mkv":
+                {"height": 1080, "size": 1_500_000_000, "mtime": 1},
+        })
+        winner, _ = mc._pick_episode_winner(
+            [a, b], prefer_release_group="AMZN.*WEBRip|x265|ImE",
+        )
+        assert winner == b
+
+    def test_size_beats_mtime(self, tmp_path, monkeypatch):
+        a = self._mk_link(tmp_path, "a.S01E01.mkv")
+        b = self._mk_link(tmp_path, "b.S01E01.mkv")
+        self._stub_probe(monkeypatch, {
+            "a.S01E01.mkv": {"height": 720, "size": 100, "mtime": 1.0},
+            "b.S01E01.mkv": {"height": 720, "size": 50,  "mtime": 999.0},
+        })
+        winner, _ = mc._pick_episode_winner([a, b])
+        assert winner == a
+
+    def test_name_lexical_fallback(self, tmp_path, monkeypatch):
+        a = self._mk_link(tmp_path, "a.S01E01.mkv")
+        b = self._mk_link(tmp_path, "b.S01E01.mkv")
+        # All probe signals equal → lex ascending wins.
+        equal = {"height": 720, "size": 1, "mtime": 1.0}
+        self._stub_probe(monkeypatch, {
+            "a.S01E01.mkv": equal, "b.S01E01.mkv": equal,
+        })
+        winner, _ = mc._pick_episode_winner([a, b])
+        assert winner == a
+
+
+class TestScanEpisodeDupes:
+    """_scan_episode_dupes walks TYPE_DIRs and groups by (season, episode)."""
+
+    def _stage(self, tmp_path, layout):
+        """layout: {type_name: {show: {season_dir: [(filename, target_name)]}}}"""
+        src = tmp_path / "_src"
+        src.mkdir(exist_ok=True)
+        type_dirs = {}
+        for type_name, shows in layout.items():
+            base = tmp_path / type_name
+            base.mkdir()
+            type_dirs[type_name] = base
+            for show, seasons in shows.items():
+                for season_dir, entries in seasons.items():
+                    d = base / show / season_dir
+                    d.mkdir(parents=True)
+                    for fname, tgt in entries:
+                        tgt_path = src / tgt
+                        if not tgt_path.exists():
+                            tgt_path.write_text(tgt)
+                        (d / fname).symlink_to(tgt_path)
+        orig = mc.TYPE_DIRS.copy()
+        mc.TYPE_DIRS.clear()
+        mc.TYPE_DIRS.update(type_dirs)
+
+        def restore():
+            mc.TYPE_DIRS.clear()
+            mc.TYPE_DIRS.update(orig)
+
+        return restore
+
+    def test_no_dupes_returns_empty(self, tmp_path):
+        restore = self._stage(tmp_path, {
+            "tv": {"Show": {"Season 1": [
+                ("Show.S01E01.mkv", "s1e1.mkv"),
+                ("Show.S01E02.mkv", "s1e2.mkv"),
+            ]}},
+        })
+        try:
+            assert mc._scan_episode_dupes() == []
+        finally:
+            restore()
+
+    def test_two_encodings_grouped(self, tmp_path):
+        restore = self._stage(tmp_path, {
+            "tv": {"SVU": {"Season 6": [
+                ("S06E01.GENERIC.mkv",                            "g1.mkv"),
+                ("Law.Order.SVU.S06E01.AMZN.WEBRip.x265.ImE.mkv", "a1.mkv"),
+                ("S06E02.GENERIC.mkv",                            "g2.mkv"),
+            ]}},
+        })
+        try:
+            dupes = mc._scan_episode_dupes()
+            assert len(dupes) == 1
+            d = dupes[0]
+            assert d["season"] == 6 and d["episode"] == 1
+            assert len(d["links"]) == 2
+            assert d["type"] == "tv"
+            assert d["show"] == "SVU"
+        finally:
+            restore()
+
+    def test_skips_non_season_dirs(self, tmp_path):
+        restore = self._stage(tmp_path, {
+            "tv": {"Show": {"Specials": [  # not a season dir
+                ("Show.S00E01.mkv", "x1.mkv"),
+                ("Show.S00E01.alt.mkv", "x2.mkv"),
+            ]}},
+        })
+        try:
+            # "Specials" is not a Season N dir → no scan, no dupes reported.
+            assert mc._scan_episode_dupes() == []
+        finally:
+            restore()
+
+    def test_movies_dir_ignored(self, tmp_path):
+        # Movies live flat; no Season N dirs → no dupes.
+        restore = self._stage(tmp_path, {
+            "movie": {"Andor (2022)": {"Season 1": [
+                ("Andor.S01E01.mkv", "x.mkv"),
+                ("Andor.S01E01.alt.mkv", "y.mkv"),
+            ]}},
+        })
+        # Movies normally don't have Season N — but if they do, treat consistently.
+        # The function only filters on _is_season_dir, so movies' "Season 1" *would*
+        # be scanned. Keep this test as a sanity check on TYPE_DIRS traversal.
+        try:
+            dupes = mc._scan_episode_dupes()
+            assert len(dupes) == 1
+            assert dupes[0]["type"] == "movie"
+        finally:
+            restore()
+
+
+class TestReportEpisodeDuplicates:
+    """report_episode_duplicates text + JSON output shape."""
+
+    def _stage(self, tmp_path, layout):
+        return TestScanEpisodeDupes._stage(self, tmp_path, layout)
+
+    def test_empty_prints_no_dupes(self, tmp_path, capsys):
+        restore = self._stage(tmp_path, {
+            "tv": {"Show": {"Season 1": [("Show.S01E01.mkv", "x.mkv")]}},
+        })
+        try:
+            mc.report_episode_duplicates()
+            out = capsys.readouterr().out
+            assert "No episode-level duplicates found." in out
+        finally:
+            restore()
+
+    def test_text_report_lists_keep_and_drops(self, tmp_path, capsys, monkeypatch):
+        restore = self._stage(tmp_path, {
+            "tv": {"SVU": {"Season 6": [
+                ("S06E01.GENERIC.mkv",                            "g.mkv"),
+                ("Law.Order.SVU.S06E01.AMZN.WEBRip.x265.ImE.mkv", "a.mkv"),
+            ]}},
+        })
+        # Force the AMZN-tagged file to win via the regex.
+        monkeypatch.setattr(mc, "_episode_probe", lambda l: {
+            "height": 1080, "size": 1, "mtime": 1.0,
+            "has_subs": False, "sub_count": 0,
+        })
+        monkeypatch.setattr(mc, "_external_subs_present", lambda l: False)
+        try:
+            mc.report_episode_duplicates(prefer_release_group="AMZN|x265|ImE")
+            out = capsys.readouterr().out
+            assert "SVU" in out
+            assert "S06E01: 2 encodings" in out
+            # Winner line gets the "← keep" mark; the GENERIC file does not.
+            keep_line = next(
+                l for l in out.splitlines() if "← keep" in l
+            )
+            assert "AMZN" in keep_line
+            assert "Symlinks that would be unlinked: 1" in out
+        finally:
+            restore()
+
+    def test_json_output_shape(self, tmp_path, capsys, monkeypatch):
+        restore = self._stage(tmp_path, {
+            "tv": {"SVU": {"Season 6": [
+                ("S06E01.GENERIC.mkv",                            "g.mkv"),
+                ("Law.Order.SVU.S06E01.AMZN.WEBRip.x265.ImE.mkv", "a.mkv"),
+            ]}},
+        })
+        monkeypatch.setattr(mc, "_episode_probe", lambda l: {
+            "height": 1080, "size": 1, "mtime": 1.0,
+            "has_subs": False, "sub_count": 0,
+        })
+        monkeypatch.setattr(mc, "_external_subs_present", lambda l: False)
+        try:
+            mc.report_episode_duplicates(
+                json_output=True, prefer_release_group="AMZN",
+            )
+            data = json.loads(capsys.readouterr().out)
+            assert len(data) == 1
+            grp = data[0]
+            assert grp["season"] == 6 and grp["episode"] == 1
+            assert len(grp["candidates"]) == 2
+            winners = [c for c in grp["candidates"] if c["is_winner"]]
+            assert len(winners) == 1
+            assert "AMZN" in winners[0]["path"]
+        finally:
+            restore()
+
+
+class TestMergeEpisodeDuplicates:
+    """merge_episode_duplicates dry-run vs apply, targets stay intact."""
+
+    def _stage(self, tmp_path, layout):
+        return TestScanEpisodeDupes._stage(self, tmp_path, layout)
+
+    def test_dry_run_makes_no_changes(self, tmp_path, monkeypatch):
+        restore = self._stage(tmp_path, {
+            "tv": {"SVU": {"Season 6": [
+                ("S06E01.A.mkv", "ga.mkv"),
+                ("S06E01.B.mkv", "gb.mkv"),
+            ]}},
+        })
+        monkeypatch.setattr(mc, "_episode_probe", lambda l: {
+            "height": 1080, "size": 1, "mtime": 1.0,
+        })
+        monkeypatch.setattr(mc, "_external_subs_present", lambda l: False)
+        try:
+            report = mc.merge_episode_duplicates(dry_run=True)
+            assert report["dry_run"] is True
+            assert report["unlinked"] == 1
+            season = tmp_path / "tv" / "SVU" / "Season 6"
+            files = sorted(p.name for p in season.iterdir())
+            # Both symlinks still on disk in dry-run mode.
+            assert files == ["S06E01.A.mkv", "S06E01.B.mkv"]
+        finally:
+            restore()
+
+    def test_apply_unlinks_losers_only(self, tmp_path, monkeypatch):
+        restore = self._stage(tmp_path, {
+            "tv": {"SVU": {"Season 6": [
+                ("S06E01.GENERIC.mkv",                            "g.mkv"),
+                ("Law.Order.SVU.S06E01.AMZN.WEBRip.x265.ImE.mkv", "a.mkv"),
+            ]}},
+        })
+        monkeypatch.setattr(mc, "_episode_probe", lambda l: {
+            "height": 1080, "size": 1, "mtime": 1.0,
+        })
+        monkeypatch.setattr(mc, "_external_subs_present", lambda l: False)
+        try:
+            mc.merge_episode_duplicates(
+                dry_run=False, prefer_release_group="AMZN|x265|ImE",
+            )
+            season = tmp_path / "tv" / "SVU" / "Season 6"
+            remaining = sorted(p.name for p in season.iterdir())
+            # AMZN file should be the sole survivor.
+            assert remaining == [
+                "Law.Order.SVU.S06E01.AMZN.WEBRip.x265.ImE.mkv",
+            ]
+            # Target files (in _src) must be intact.
+            src = tmp_path / "_src"
+            assert (src / "g.mkv").exists()
+            assert (src / "a.mkv").exists()
+        finally:
+            restore()
+
+    def test_apply_no_dupes_is_noop(self, tmp_path):
+        restore = self._stage(tmp_path, {
+            "tv": {"Show": {"Season 1": [
+                ("Show.S01E01.mkv", "x1.mkv"),
+                ("Show.S01E02.mkv", "x2.mkv"),
+            ]}},
+        })
+        try:
+            report = mc.merge_episode_duplicates(dry_run=False)
+            assert report["unlinked"] == 0
+            assert report["groups"] == []
+        finally:
+            restore()
+
+    def test_json_output_shape(self, tmp_path, capsys, monkeypatch):
+        restore = self._stage(tmp_path, {
+            "tv": {"SVU": {"Season 6": [
+                ("S06E01.A.mkv", "a.mkv"),
+                ("S06E01.B.mkv", "b.mkv"),
+            ]}},
+        })
+        monkeypatch.setattr(mc, "_episode_probe", lambda l: {
+            "height": 1080, "size": 1, "mtime": 1.0,
+        })
+        monkeypatch.setattr(mc, "_external_subs_present", lambda l: False)
+        try:
+            mc.merge_episode_duplicates(dry_run=True, json_output=True)
+            data = json.loads(capsys.readouterr().out)
+            assert data["dry_run"] is True
+            assert data["unlinked"] == 1
+            assert len(data["groups"]) == 1
+            assert data["groups"][0]["season"] == 6
+            assert data["groups"][0]["episode"] == 1
+            assert len(data["groups"][0]["unlinked"]) == 1
+        finally:
+            restore()
