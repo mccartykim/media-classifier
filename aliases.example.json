@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Seed aliases for media-classifier --merge-dupes.",
+    "",
+    "Format:",
+    "  aliases.<variant-name> = {canonical?: string, type?: 'tv'|'anime'|'movie'}",
+    "",
+    "  - 'canonical' renames the show on merge AND bridges cross-key collisions",
+    "    (e.g. abbreviations the normalizer can't reconcile).",
+    "  - 'type' is required for cross-TYPE_DIR groups so the merger knows which",
+    "    side to keep. Without 'type', cross-type groups go to needs-review.",
+    "",
+    "Each entry was identified by obsidian's --report-dupes run on prod /srv/media",
+    "(see mc-imk bead history)."
+  ],
+  "aliases": {
+    "Law and Order SVU 1999": {
+      "canonical": "Law & Order Special Victims Unit (1999)",
+      "type": "tv"
+    },
+    "Law and Order SVU": {
+      "canonical": "Law & Order Special Victims Unit (1999)",
+      "type": "tv"
+    },
+    "Law And Order SVU": {
+      "canonical": "Law & Order Special Victims Unit (1999)",
+      "type": "tv"
+    },
+    "Law & Order SVU 1999": {
+      "canonical": "Law & Order Special Victims Unit (1999)",
+      "type": "tv"
+    },
+    "Law And Order Special Victims Unit": {
+      "canonical": "Law & Order Special Victims Unit (1999)",
+      "type": "tv"
+    },
+    "The Venture Bros.": {"type": "tv"},
+    "Undead Unluck": {"type": "anime"}
+  }
+}

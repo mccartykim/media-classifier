@@ -994,3 +994,456 @@ class TestReportDupes:
             assert "Total within-type duplicate groups: 0" in out
         finally:
             restore()
+
+
+# =============================================================================
+# Phase 2: --merge-dupes
+# =============================================================================
+
+class TestMergeDupes:
+    """mc-imk Phase 2: merge sibling dirs that --report-dupes identified."""
+
+    def _stage_with_symlinks(self, tmp_path, layout, source_root=None):
+        """Build TYPE_DIRS under tmp_path with SYMLINKS pointing into a source dir.
+
+        layout: {type_name: {show_dir: [{"rel": "Season 1/ep.mkv", "src": "v1.mkv"}, ...]}}
+
+        Each entry creates a symlink at <type>/<show>/<rel> pointing at <source>/<src>.
+        Source files are deduplicated by name (same src across multiple entries → one
+        physical file, multiple symlinks to it).
+        """
+        source = source_root or (tmp_path / "_src")
+        source.mkdir(exist_ok=True)
+
+        type_dirs = {}
+        for type_name, shows in layout.items():
+            base = tmp_path / type_name
+            base.mkdir()
+            type_dirs[type_name] = base
+            for show, entries in shows.items():
+                for entry in entries:
+                    src_file = source / entry["src"]
+                    if not src_file.exists():
+                        src_file.write_text(entry["src"])
+                    link = base / show / entry["rel"]
+                    link.parent.mkdir(parents=True, exist_ok=True)
+                    link.symlink_to(src_file)
+
+        orig = mc.TYPE_DIRS.copy()
+        mc.TYPE_DIRS.clear()
+        mc.TYPE_DIRS.update(type_dirs)
+
+        def restore():
+            mc.TYPE_DIRS.clear()
+            mc.TYPE_DIRS.update(orig)
+
+        return restore
+
+    # --- _pick_canonical -----------------------------------------------------
+
+    def test_pick_canonical_prefers_most_files(self, tmp_path):
+        a = tmp_path / "A"
+        b = tmp_path / "B"
+        chosen, _ = mc._pick_canonical([(a, 3), (b, 10)])
+        assert chosen == b
+
+    def test_pick_canonical_alphabetical_tiebreak(self, tmp_path):
+        a = tmp_path / "Andor"
+        b = tmp_path / "Andor (2022)"
+        chosen, _ = mc._pick_canonical([(a, 12), (b, 12)])
+        assert chosen == a  # "Andor" < "Andor (2022)" alphabetically
+
+    def test_pick_canonical_prefer_year_form(self, tmp_path):
+        a = tmp_path / "Andor"
+        b = tmp_path / "Andor (2022)"
+        chosen, _ = mc._pick_canonical([(a, 12), (b, 12)], prefer_year_form=True)
+        assert chosen == b
+
+    def test_pick_canonical_override_wins(self, tmp_path):
+        a = tmp_path / "BigFile"
+        b = tmp_path / "Andor (2022)"
+        chosen, _ = mc._pick_canonical(
+            [(a, 100), (b, 1)], override_name="Andor (2022)",
+        )
+        assert chosen == b
+
+    def test_pick_canonical_alias_preferred_wins_over_count(self, tmp_path):
+        a = tmp_path / "BigFile"
+        b = tmp_path / "Special Form"
+        chosen, _ = mc._pick_canonical(
+            [(a, 100), (b, 1)], alias_preferred_name="Special Form",
+        )
+        assert chosen == b
+
+    # --- _parse_canonical_override -------------------------------------------
+
+    def test_parse_canonical_override_round_trip(self):
+        key, name = mc._parse_canonical_override("Andor=Andor (2022)")
+        assert key == mc._normalize_show_key("Andor")
+        assert name == "Andor (2022)"
+
+    def test_parse_canonical_override_bad_input_exits(self):
+        with pytest.raises(SystemExit):
+            mc._parse_canonical_override("no-equals-sign")
+
+    # --- _load_aliases / _alias_lookup ---------------------------------------
+
+    def test_load_aliases_json(self, tmp_path):
+        p = tmp_path / "a.json"
+        p.write_text(json.dumps({
+            "aliases": {
+                "Law and Order SVU 1999": {
+                    "canonical": "Law & Order Special Victims Unit (1999)",
+                    "type": "tv",
+                },
+                "Bare String": "Bare Canonical",
+            }
+        }))
+        aliases = mc._load_aliases(str(p))
+        assert aliases["Law and Order SVU 1999"]["canonical"] == \
+            "Law & Order Special Victims Unit (1999)"
+        assert aliases["Law and Order SVU 1999"]["type"] == "tv"
+        assert aliases["Bare String"] == {"canonical": "Bare Canonical", "type": None}
+
+    def test_alias_lookup_normalized_match(self):
+        aliases = {"Law and Order SVU 1999": {"canonical": "X", "type": "tv"}}
+        # Different casing/punctuation should still match via normalized key
+        spec = mc._alias_lookup(aliases, "law & order svu 1999")
+        assert spec is not None
+        assert spec["canonical"] == "X"
+
+    def test_alias_lookup_no_match(self):
+        aliases = {"Foo": {"canonical": "Foo Bar", "type": "tv"}}
+        assert mc._alias_lookup(aliases, "Different Show") is None
+        assert mc._alias_lookup({}, "anything") is None
+        assert mc._alias_lookup(None, "anything") is None
+
+    # --- _merge_show_dir -----------------------------------------------------
+
+    def test_merge_show_dir_moves_symlinks_into_target(self, tmp_path):
+        source = tmp_path / "src"
+        source.mkdir()
+        src_show = tmp_path / "A"
+        dst_show = tmp_path / "B"
+        (src_show / "Season 1").mkdir(parents=True)
+        (dst_show / "Season 1").mkdir(parents=True)
+        ep_target = source / "ep1.mkv"
+        ep_target.write_text("v")
+        (src_show / "Season 1" / "ep1.mkv").symlink_to(ep_target)
+
+        stats = mc._merge_show_dir(src_show, dst_show, dry_run=False)
+        assert len(stats["moves"]) == 1
+        assert stats["src_removed"]
+        assert not src_show.exists()
+        moved = dst_show / "Season 1" / "ep1.mkv"
+        assert moved.is_symlink()
+        assert os.readlink(moved) == str(ep_target)
+
+    def test_merge_show_dir_dry_run_makes_no_changes(self, tmp_path):
+        source = tmp_path / "src"
+        source.mkdir()
+        src_show = tmp_path / "A"
+        dst_show = tmp_path / "B"
+        (src_show / "Season 1").mkdir(parents=True)
+        dst_show.mkdir()
+        ep_target = source / "ep1.mkv"
+        ep_target.write_text("v")
+        link = src_show / "Season 1" / "ep1.mkv"
+        link.symlink_to(ep_target)
+
+        stats = mc._merge_show_dir(src_show, dst_show, dry_run=True)
+        assert len(stats["moves"]) == 1
+        assert not stats["src_removed"]
+        # Source still present, destination still empty
+        assert link.is_symlink()
+        assert not (dst_show / "Season 1" / "ep1.mkv").exists()
+
+    def test_merge_show_dir_same_target_skipped(self, tmp_path):
+        source = tmp_path / "src"
+        source.mkdir()
+        ep_target = source / "ep1.mkv"
+        ep_target.write_text("v")
+        src_show = tmp_path / "A"
+        dst_show = tmp_path / "B"
+        (src_show / "Season 1").mkdir(parents=True)
+        (dst_show / "Season 1").mkdir(parents=True)
+        (src_show / "Season 1" / "ep1.mkv").symlink_to(ep_target)
+        (dst_show / "Season 1" / "ep1.mkv").symlink_to(ep_target)
+
+        stats = mc._merge_show_dir(src_show, dst_show, dry_run=False)
+        assert stats["moves"] == []
+        assert len(stats["same_target"]) == 1
+        assert stats["conflicts"] == []
+        # Source's duplicate symlink should be gone
+        assert not (src_show / "Season 1" / "ep1.mkv").exists()
+        # Destination still in place
+        assert (dst_show / "Season 1" / "ep1.mkv").is_symlink()
+
+    def test_merge_show_dir_differing_target_is_conflict(self, tmp_path):
+        source = tmp_path / "src"
+        source.mkdir()
+        v1 = source / "v1.mkv"; v1.write_text("v1")
+        v2 = source / "v2.mkv"; v2.write_text("v2")
+        src_show = tmp_path / "A"
+        dst_show = tmp_path / "B"
+        (src_show / "Season 1").mkdir(parents=True)
+        (dst_show / "Season 1").mkdir(parents=True)
+        (src_show / "Season 1" / "ep1.mkv").symlink_to(v1)
+        (dst_show / "Season 1" / "ep1.mkv").symlink_to(v2)
+
+        stats = mc._merge_show_dir(src_show, dst_show, dry_run=False)
+        assert stats["moves"] == []
+        assert stats["same_target"] == []
+        assert len(stats["conflicts"]) == 1
+        # Source dir not removed because conflict left a file behind
+        assert (src_show / "Season 1" / "ep1.mkv").exists()
+        assert not stats["src_removed"]
+
+    def test_merge_show_dir_merges_into_existing_season(self, tmp_path):
+        """Season N in src merges into Season N in dst — not nested."""
+        source = tmp_path / "src"
+        source.mkdir()
+        e1 = source / "e1.mkv"; e1.write_text("e1")
+        e2 = source / "e2.mkv"; e2.write_text("e2")
+        src_show = tmp_path / "A"
+        dst_show = tmp_path / "B"
+        (src_show / "Season 1").mkdir(parents=True)
+        (dst_show / "Season 1").mkdir(parents=True)
+        (src_show / "Season 1" / "ep1.mkv").symlink_to(e1)
+        (dst_show / "Season 1" / "ep2.mkv").symlink_to(e2)
+
+        mc._merge_show_dir(src_show, dst_show, dry_run=False)
+
+        season1 = dst_show / "Season 1"
+        assert sorted(p.name for p in season1.iterdir()) == ["ep1.mkv", "ep2.mkv"]
+        # No nested "Season 1/Season 1" produced
+        assert not (season1 / "Season 1").exists()
+
+    # --- merge_duplicates orchestration -------------------------------------
+
+    def test_merge_duplicates_within_type_dry_run(self, tmp_path, capsys):
+        restore = self._stage_with_symlinks(tmp_path, {
+            "tv": {
+                "Andor":        [{"rel": "Season 1/ep1.mkv", "src": "andor_s1e1.mkv"}],
+                "Andor (2022)": [
+                    {"rel": "Season 2/ep1.mkv", "src": "andor_s2e1.mkv"},
+                    {"rel": "Season 2/ep2.mkv", "src": "andor_s2e2.mkv"},
+                ],
+            },
+        })
+        try:
+            report = mc.merge_duplicates(dry_run=True)
+            assert report["dry_run"]
+            assert len(report["within_type"]) == 1
+            grp = report["within_type"][0]
+            # Andor (2022) has more files → canonical
+            assert grp["canonical"].endswith("Andor (2022)")
+            # Both source dirs still on disk (dry-run)
+            assert (tmp_path / "tv" / "Andor" / "Season 1" / "ep1.mkv").is_symlink()
+            assert (tmp_path / "tv" / "Andor (2022)" / "Season 2" / "ep1.mkv").is_symlink()
+        finally:
+            restore()
+
+    def test_merge_duplicates_within_type_apply(self, tmp_path):
+        restore = self._stage_with_symlinks(tmp_path, {
+            "tv": {
+                "Andor":        [{"rel": "Season 1/ep1.mkv", "src": "a_s1e1.mkv"}],
+                "Andor (2022)": [
+                    {"rel": "Season 2/ep1.mkv", "src": "a_s2e1.mkv"},
+                    {"rel": "Season 2/ep2.mkv", "src": "a_s2e2.mkv"},
+                ],
+            },
+        })
+        try:
+            mc.merge_duplicates(dry_run=False, prefer_year_form=True)
+            base = tmp_path / "tv"
+            shows = sorted(p.name for p in base.iterdir())
+            assert shows == ["Andor (2022)"]
+            files = sorted(
+                str(p.relative_to(base / "Andor (2022)"))
+                for p in (base / "Andor (2022)").rglob("*")
+                if p.is_symlink()
+            )
+            assert files == ["Season 1/ep1.mkv", "Season 2/ep1.mkv", "Season 2/ep2.mkv"]
+        finally:
+            restore()
+
+    def test_merge_duplicates_alias_bridges_cross_key_collision(self, tmp_path):
+        """SVU case: aliases let two normalized-key groups collapse into one."""
+        restore = self._stage_with_symlinks(tmp_path, {
+            "tv": {
+                "Law & Order Special Victims Unit (1999)": [
+                    {"rel": "Season 1/ep1.mkv", "src": "svu_s1e1.mkv"},
+                    {"rel": "Season 1/ep2.mkv", "src": "svu_s1e2.mkv"},
+                ],
+                "Law and Order SVU 1999": [
+                    {"rel": "Season 2/ep1.mkv", "src": "svu_s2e1.mkv"},
+                ],
+            },
+        })
+        aliases_file = tmp_path / "aliases.json"
+        aliases_file.write_text(json.dumps({
+            "aliases": {
+                "Law and Order SVU 1999": {
+                    "canonical": "Law & Order Special Victims Unit (1999)",
+                    "type": "tv",
+                },
+            },
+        }))
+        try:
+            report = mc.merge_duplicates(
+                dry_run=False, aliases_path=str(aliases_file),
+            )
+            # No conflicts, no needs-review
+            assert report["needs_review"] == []
+            assert len(report["within_type"]) == 1
+            grp = report["within_type"][0]
+            assert grp["canonical"].endswith(
+                "Law & Order Special Victims Unit (1999)"
+            )
+            # All seasons under the canonical dir
+            base = tmp_path / "tv" / "Law & Order Special Victims Unit (1999)"
+            seasons = sorted(p.name for p in base.iterdir())
+            assert seasons == ["Season 1", "Season 2"]
+            # Source dir gone
+            assert not (tmp_path / "tv" / "Law and Order SVU 1999").exists()
+        finally:
+            restore()
+
+    def test_merge_duplicates_cross_type_needs_alias(self, tmp_path):
+        restore = self._stage_with_symlinks(tmp_path, {
+            "tv":    {"Undead Unluck": [{"rel": "Season 1/e1.mkv", "src": "uu1.mkv"}]},
+            "anime": {"Undead Unluck": [{"rel": "Season 1/e2.mkv", "src": "uu2.mkv"}]},
+        })
+        try:
+            # No aliases → goes to needs_review
+            report = mc.merge_duplicates(dry_run=True)
+            assert len(report["needs_review"]) == 1
+            assert report["needs_review"][0]["key"] == "undead unluck"
+            # Both source dirs untouched
+            assert (tmp_path / "tv" / "Undead Unluck").exists()
+            assert (tmp_path / "anime" / "Undead Unluck").exists()
+        finally:
+            restore()
+
+    def test_merge_duplicates_cross_type_apply_with_alias(self, tmp_path):
+        restore = self._stage_with_symlinks(tmp_path, {
+            "tv":    {"Undead Unluck": [{"rel": "Season 1/e_tv.mkv",    "src": "uu_tv.mkv"}]},
+            "anime": {"Undead Unluck": [{"rel": "Season 1/e_anime.mkv", "src": "uu_an.mkv"}]},
+        })
+        aliases_file = tmp_path / "aliases.json"
+        aliases_file.write_text(json.dumps({
+            "aliases": {"Undead Unluck": {"type": "anime"}},
+        }))
+        try:
+            mc.merge_duplicates(dry_run=False, aliases_path=str(aliases_file))
+            # tv copy should be gone, anime has both episodes
+            assert not (tmp_path / "tv" / "Undead Unluck").exists()
+            anime_files = sorted(
+                p.name for p in (tmp_path / "anime" / "Undead Unluck" / "Season 1").iterdir()
+            )
+            assert anime_files == ["e_anime.mkv", "e_tv.mkv"]
+        finally:
+            restore()
+
+    def test_merge_duplicates_canonical_override(self, tmp_path):
+        """User can force a specific dir to be canonical regardless of file counts."""
+        restore = self._stage_with_symlinks(tmp_path, {
+            "tv": {
+                "Andor":        [{"rel": "S1/e.mkv", "src": "a1.mkv"}],
+                "Andor (2022)": [
+                    {"rel": "S2/e1.mkv", "src": "a2.mkv"},
+                    {"rel": "S2/e2.mkv", "src": "a3.mkv"},
+                    {"rel": "S2/e3.mkv", "src": "a4.mkv"},
+                ],
+            },
+        })
+        try:
+            mc.merge_duplicates(
+                dry_run=False,
+                canonical_overrides=["Andor=Andor"],
+            )
+            # Despite Andor (2022) having more files, override forces "Andor"
+            base = tmp_path / "tv"
+            shows = sorted(p.name for p in base.iterdir())
+            assert shows == ["Andor"]
+        finally:
+            restore()
+
+    def test_merge_duplicates_no_dupes_returns_empty(self, tmp_path):
+        restore = self._stage_with_symlinks(tmp_path, {
+            "tv": {"Andor": [{"rel": "S1/e.mkv", "src": "a.mkv"}]},
+        })
+        try:
+            report = mc.merge_duplicates(dry_run=True)
+            assert report["within_type"] == []
+            assert report["cross_type"] == []
+            assert report["needs_review"] == []
+        finally:
+            restore()
+
+    def test_merge_duplicates_json_output(self, tmp_path, capsys):
+        restore = self._stage_with_symlinks(tmp_path, {
+            "tv": {
+                "Andor":        [{"rel": "S1/e.mkv",  "src": "a.mkv"}],
+                "Andor (2022)": [
+                    {"rel": "S2/e1.mkv", "src": "b1.mkv"},
+                    {"rel": "S2/e2.mkv", "src": "b2.mkv"},
+                ],
+            },
+        })
+        try:
+            mc.merge_duplicates(dry_run=True, json_output=True)
+            out = capsys.readouterr().out
+            data = json.loads(out)
+            assert data["dry_run"]
+            assert len(data["within_type"]) == 1
+            assert data["within_type"][0]["canonical"].endswith("Andor (2022)")
+        finally:
+            restore()
+
+    def test_merge_duplicates_conflict_reported_and_src_retained(self, tmp_path):
+        """When source and dest have differing symlinks at the same path,
+        the merge must skip with a conflict and leave the source dir in place."""
+        source = tmp_path / "_src"
+        source.mkdir()
+        v1 = source / "v1.mkv"; v1.write_text("v1")
+        v2 = source / "v2.mkv"; v2.write_text("v2")
+        tv = tmp_path / "tv"
+        (tv / "Andor" / "Season 1").mkdir(parents=True)
+        (tv / "Andor (2022)" / "Season 1").mkdir(parents=True)
+        (tv / "Andor" / "Season 1" / "ep1.mkv").symlink_to(v1)
+        (tv / "Andor (2022)" / "Season 1" / "ep1.mkv").symlink_to(v2)
+
+        orig = mc.TYPE_DIRS.copy()
+        mc.TYPE_DIRS.clear()
+        mc.TYPE_DIRS["tv"] = tv
+        try:
+            report = mc.merge_duplicates(dry_run=False, prefer_year_form=True)
+            grp = report["within_type"][0]
+            # Andor (2022) is canonical; Andor's ep1.mkv conflicts
+            merge = grp["merges"][0]
+            assert merge["moved"] == 0
+            assert len(merge["conflicts"]) == 1
+            assert not merge["src_removed"]
+            # The conflicting source symlink survives
+            assert (tv / "Andor" / "Season 1" / "ep1.mkv").is_symlink()
+        finally:
+            mc.TYPE_DIRS.clear()
+            mc.TYPE_DIRS.update(orig)
+
+    def test_merge_duplicates_yaml_aliases_skipped_without_pyyaml(self, tmp_path):
+        """YAML aliases path raises SystemExit if PyYAML isn't installed.
+
+        Skipped when PyYAML *is* present — we just want to confirm the failure
+        mode is a clean SystemExit rather than an ImportError surfacing.
+        """
+        try:
+            import yaml  # noqa: F401
+            pytest.skip("PyYAML installed — can't exercise the missing-module path")
+        except ImportError:
+            pass
+        p = tmp_path / "aliases.yaml"
+        p.write_text("aliases: {}\n")
+        with pytest.raises(SystemExit):
+            mc._load_aliases(str(p))

@@ -6,6 +6,7 @@ evidence gathering, scoring, and local LLM arbiter for ambiguous cases.
 """
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -1063,15 +1064,22 @@ def _season_collisions(dirs):
     return {n: ps for n, ps in by_season.items() if len(ps) > 1}
 
 
-def _scan_dupe_groups():
+def _scan_dupe_groups(aliases=None):
     """Group sibling directories under each TYPE_DIR by normalized show key.
 
-    Returns (within_type, cross_type):
+    If `aliases` is given, directories matching an alias are re-keyed under the
+    alias canonical's normalized key. This collapses cross-key collisions
+    (e.g. "Law and Order SVU" and "Law & Order Special Victims Unit") into a
+    single group when an alias bridges them.
+
+    Returns (within_type, cross_type, alias_canonical_by_key):
       within_type: {type_name: [(key, [(path, file_count), ...]), ...]}  groups with >1 dir
       cross_type:  [(key, [(type_name, path, file_count), ...])]         keys spanning >1 type
+      alias_canonical_by_key: {effective_key: alias_canonical_name}
     """
     within_type = {}
     by_key_global = {}  # key -> [(type_name, path, count)]
+    alias_canonical_by_key = {}
 
     for type_name, type_dir in TYPE_DIRS.items():
         if not type_dir.is_dir():
@@ -1084,7 +1092,12 @@ def _scan_dupe_groups():
         for child in children:
             if not child.is_dir():
                 continue
-            key = _normalize_show_key(child.name)
+            spec = _alias_lookup(aliases, child.name) if aliases else None
+            if spec and spec.get("canonical"):
+                key = _normalize_show_key(spec["canonical"])
+                alias_canonical_by_key[key] = spec["canonical"]
+            else:
+                key = _normalize_show_key(child.name)
             if not key:
                 continue
             count = _count_media_files(child)
@@ -1104,7 +1117,7 @@ def _scan_dupe_groups():
         ),
         key=lambda kv: kv[0],
     )
-    return within_type, cross_type
+    return within_type, cross_type, alias_canonical_by_key
 
 
 def _suggest_canonical(entries):
@@ -1119,7 +1132,7 @@ def report_duplicates(json_output=False):
     Cross-type groups: same normalized key appears under more than one TYPE_DIR
     (e.g. a show split between TV Shows/ and Anime/).
     """
-    within_type, cross_type = _scan_dupe_groups()
+    within_type, cross_type, _ = _scan_dupe_groups()
 
     if json_output:
         out = {
@@ -1184,6 +1197,381 @@ def report_duplicates(json_output=False):
         f"\nTotal cross-type duplicate groups:  {len(cross_type)}"
         f"\nTotal season-level collisions:      {total_season_collisions}"
     )
+
+
+# =============================================================================
+# Phase 2: merge duplicate show dirs (--merge-dupes)
+# =============================================================================
+
+def _load_aliases(path):
+    """Load alias spec from JSON or YAML. Returns {variant: {canonical, type}}.
+
+    File format::
+
+        {
+          "aliases": {
+            "Law and Order SVU 1999": {
+              "canonical": "Law & Order Special Victims Unit (1999)",
+              "type": "tv"
+            },
+            "Undead Unluck": {"type": "anime"}
+          }
+        }
+
+    YAML accepted if PyYAML is installed. A bare string value is treated as
+    ``{"canonical": <string>}``.
+    """
+    p = Path(path)
+    text = p.read_text()
+    if p.suffix.lower() in (".yaml", ".yml"):
+        try:
+            import yaml  # type: ignore
+        except ImportError:
+            raise SystemExit(
+                f"PyYAML required to load {path!r}. Install pyyaml or convert to JSON."
+            )
+        data = yaml.safe_load(text) or {}
+    else:
+        data = json.loads(text)
+
+    raw = data.get("aliases", {}) if isinstance(data, dict) else {}
+    out = {}
+    for variant, spec in raw.items():
+        if isinstance(spec, str):
+            out[variant] = {"canonical": spec, "type": None}
+        elif isinstance(spec, dict):
+            out[variant] = {
+                "canonical": spec.get("canonical") or variant,
+                "type": spec.get("type"),
+            }
+    return out
+
+
+def _alias_lookup(aliases, name):
+    """Find alias spec for a directory name. Matches raw name or normalized key."""
+    if not aliases or not name:
+        return None
+    if name in aliases:
+        return aliases[name]
+    key = _normalize_show_key(name)
+    if not key:
+        return None
+    for variant, spec in aliases.items():
+        if _normalize_show_key(variant) == key:
+            return spec
+    return None
+
+
+_YEAR_PAREN_RE = re.compile(r"\((?:19|20)\d{2}\)")
+
+
+def _pick_canonical(entries, prefer_year_form=False, override_name=None,
+                    alias_preferred_name=None):
+    """Choose canonical (path, count) from [(path, count), ...].
+
+    Priority:
+      1. ``override_name`` matches a path's basename (user --canonical flag)
+      2. ``alias_preferred_name`` matches a path's basename (from aliases file)
+      3. highest file count
+      4. ``prefer_year_form`` puts ``Name (YYYY)`` ahead of bare ``Name``
+      5. alphabetical
+    """
+    if override_name:
+        for e in entries:
+            if e[0].name == override_name:
+                return e
+    if alias_preferred_name:
+        for e in entries:
+            if e[0].name == alias_preferred_name:
+                return e
+
+    def sort_key(e):
+        path, count = e
+        has_year = bool(_YEAR_PAREN_RE.search(path.name))
+        year_rank = 0 if (prefer_year_form and has_year) else 1
+        return (-count, year_rank, path.name)
+
+    return sorted(entries, key=sort_key)[0]
+
+
+def _parse_canonical_override(spec):
+    """Parse 'KEY=NAME' into (normalized_key, name). Raises SystemExit on bad input."""
+    if "=" not in spec:
+        raise SystemExit(f"--canonical expects 'KEY=DIR_NAME', got: {spec!r}")
+    key_part, name = spec.split("=", 1)
+    return _normalize_show_key(key_part.strip()), name.strip()
+
+
+def _move_path(src, dst):
+    """Move src -> dst, recreating symlinks across filesystem boundaries.
+
+    rename(2) fails with EXDEV on cross-fs moves; for symlinks we can recreate
+    the link target on the other side and unlink the source.
+    """
+    try:
+        src.rename(dst)
+    except OSError as e:
+        if e.errno == errno.EXDEV and src.is_symlink():
+            target = os.readlink(src)
+            os.symlink(target, dst)
+            src.unlink()
+        else:
+            raise
+
+
+def _merge_show_dir(src, dst, *, dry_run=True):
+    """Move all entries from src into dst preserving relative layout.
+
+    Existing entries at the destination: if both source and target are symlinks
+    pointing to the same path, the source is dropped (safe duplicate). Otherwise
+    the move is skipped and recorded as a conflict.
+
+    Returns a stats dict::
+
+        {
+            "moves":       [(src_path, dst_path), ...],
+            "same_target": [src_path, ...],          # dropped, identical symlink
+            "conflicts":   [(src_path, dst_path, reason), ...],
+            "src_removed": bool,                     # src dir emptied and rmdir'd
+        }
+    """
+    src = Path(src)
+    dst = Path(dst)
+    moves, same_target, conflicts = [], [], []
+
+    if not src.exists():
+        return {"moves": moves, "same_target": same_target,
+                "conflicts": conflicts, "src_removed": True}
+
+    # Snapshot entries first — rglob is lazy and we mutate the tree as we go.
+    entries = sorted(src.rglob("*"), key=lambda p: (len(p.parts), str(p)))
+
+    for sp in entries:
+        # Skip plain directories — we only move leaves; empty parents are
+        # cleaned up at the end. A symlink to a directory is treated as a leaf.
+        if sp.is_dir() and not sp.is_symlink():
+            continue
+        if not sp.exists() and not sp.is_symlink():
+            continue  # may have been moved out from under us
+        rel = sp.relative_to(src)
+        target = dst / rel
+
+        if target.exists() or target.is_symlink():
+            if sp.is_symlink() and target.is_symlink():
+                try:
+                    if os.readlink(sp) == os.readlink(target):
+                        same_target.append(sp)
+                        if not dry_run:
+                            sp.unlink()
+                        continue
+                except OSError:
+                    pass
+            conflicts.append((sp, target, "target exists"))
+            continue
+
+        moves.append((sp, target))
+        if not dry_run:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _move_path(sp, target)
+
+    src_removed = False
+    if not dry_run:
+        # Bottom-up rmdir of newly-empty subdirs and src itself.
+        subdirs = [p for p in src.rglob("*") if p.is_dir() and not p.is_symlink()]
+        for d in sorted(subdirs, key=lambda p: -len(p.parts)):
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        try:
+            src.rmdir()
+            src_removed = True
+        except OSError:
+            pass
+
+    return {"moves": moves, "same_target": same_target,
+            "conflicts": conflicts, "src_removed": src_removed}
+
+
+def _resolve_cross_type_target(aliases, entries):
+    """Pick (target_type, canonical_path, source_entries) for a cross-type group.
+
+    Cross-type groups are only auto-mergeable when an alias declares the target
+    type. Without that, the classifier can't tell which type is "right" and the
+    group is returned to the caller for needs-review handling.
+
+    Returns ``(target_type, canonical_path, [other_entries])`` or ``None``.
+    """
+    target_type = None
+    for _t, path, _c in entries:
+        spec = _alias_lookup(aliases, path.name)
+        if spec and spec.get("type"):
+            target_type = spec["type"]
+            break
+    if target_type is None:
+        return None
+    target_entries = [e for e in entries if e[0] == target_type]
+    other_entries = [e for e in entries if e[0] != target_type]
+    if not target_entries:
+        return None
+    # Pick canonical among the target-type entries
+    canon_path, _ = _pick_canonical([(p, c) for _, p, c in target_entries])
+    return target_type, canon_path, other_entries + [
+        e for e in target_entries if e[1] != canon_path
+    ]
+
+
+def merge_duplicates(*, dry_run=True, aliases_path=None, prefer_year_form=False,
+                     canonical_overrides=None, json_output=False):
+    """Merge duplicate show directories in TYPE_DIRs.
+
+    Default is dry-run; pass ``dry_run=False`` to actually move symlinks.
+
+    Cross-type groups (same show under multiple TYPE_DIRs) require an aliases
+    file declaring the target ``type``; otherwise they're listed under
+    ``needs_review`` and skipped.
+    """
+    aliases = _load_aliases(aliases_path) if aliases_path else {}
+    overrides = dict(_parse_canonical_override(s) for s in (canonical_overrides or []))
+
+    within_type, cross_type, alias_canonical_by_key = _scan_dupe_groups(aliases=aliases)
+    cross_keys = {k for k, _ in cross_type}
+
+    report = {
+        "dry_run": dry_run,
+        "within_type": [],
+        "cross_type": [],
+        "needs_review": [],
+    }
+
+    def _do_merges(canonical_path, src_entries, *, type_label=None):
+        merges = []
+        for src_path, _ in src_entries:
+            if src_path == canonical_path:
+                continue
+            stats = _merge_show_dir(src_path, canonical_path, dry_run=dry_run)
+            merges.append({
+                "from": str(src_path),
+                "moved": len(stats["moves"]),
+                "skipped_same_target": len(stats["same_target"]),
+                "conflicts": [
+                    {"src": str(s), "dst": str(d), "reason": r}
+                    for s, d, r in stats["conflicts"]
+                ],
+                "src_removed": stats["src_removed"],
+            })
+        return merges
+
+    # Within-type groups (skip keys we'll process under cross-type)
+    for type_name, groups in within_type.items():
+        for key, entries in groups:
+            if key in cross_keys:
+                continue
+            canonical_path, _ = _pick_canonical(
+                entries,
+                prefer_year_form=prefer_year_form,
+                override_name=overrides.get(key),
+                alias_preferred_name=alias_canonical_by_key.get(key),
+            )
+            report["within_type"].append({
+                "type": type_name,
+                "key": key,
+                "canonical": str(canonical_path),
+                "merges": _do_merges(canonical_path, entries),
+            })
+
+    # Cross-type groups — need an alias to know which type is canonical
+    for key, entries in cross_type:
+        resolution = _resolve_cross_type_target(aliases, entries)
+        if resolution is None:
+            report["needs_review"].append({
+                "key": key,
+                "reason": "cross-type group requires aliases file entry with 'type'",
+                "directories": [
+                    {"type": t, "path": str(p), "files": c} for t, p, c in entries
+                ],
+            })
+            continue
+        target_type, canonical_path, src_entries = resolution
+        # Apply --canonical override or alias preferred name if available
+        target_type_entries = [(p, c) for t, p, c in entries if t == target_type]
+        canonical_path, _ = _pick_canonical(
+            target_type_entries,
+            prefer_year_form=prefer_year_form,
+            override_name=overrides.get(key),
+            alias_preferred_name=alias_canonical_by_key.get(key),
+        )
+        # src_entries from resolver includes paths; rebuild merge list (path, count)
+        merge_srcs = [(p, c) for _, p, c in entries if p != canonical_path]
+        report["cross_type"].append({
+            "key": key,
+            "target_type": target_type,
+            "canonical": str(canonical_path),
+            "merges": _do_merges(canonical_path, merge_srcs),
+        })
+
+    if json_output:
+        print(json.dumps(report, indent=2))
+    else:
+        _print_merge_report(report)
+
+    return report
+
+
+def _print_merge_report(report):
+    """Human-readable rendering of merge_duplicates() output."""
+    mode = "DRY-RUN" if report["dry_run"] else "APPLY"
+    print(f"=== Merge duplicates ({mode}) ===")
+
+    total_moves = total_same = total_conflicts = 0
+
+    for grp in report["within_type"]:
+        print(f"\n[{grp['type']}] {grp['key']}")
+        print(f"  canonical: {grp['canonical']}")
+        for m in grp["merges"]:
+            total_moves += m["moved"]
+            total_same += m["skipped_same_target"]
+            total_conflicts += len(m["conflicts"])
+            tag = " (removed)" if m["src_removed"] else ""
+            print(
+                f"    {m['from']}  →  moved={m['moved']} "
+                f"same-target={m['skipped_same_target']} "
+                f"conflicts={len(m['conflicts'])}{tag}"
+            )
+            for c in m["conflicts"]:
+                print(f"      ! conflict: {c['src']}  vs  {c['dst']}  ({c['reason']})")
+
+    for grp in report["cross_type"]:
+        print(f"\n[CROSS → {grp['target_type']}] {grp['key']}")
+        print(f"  canonical: {grp['canonical']}")
+        for m in grp["merges"]:
+            total_moves += m["moved"]
+            total_same += m["skipped_same_target"]
+            total_conflicts += len(m["conflicts"])
+            tag = " (removed)" if m["src_removed"] else ""
+            print(
+                f"    {m['from']}  →  moved={m['moved']} "
+                f"same-target={m['skipped_same_target']} "
+                f"conflicts={len(m['conflicts'])}{tag}"
+            )
+            for c in m["conflicts"]:
+                print(f"      ! conflict: {c['src']}  vs  {c['dst']}  ({c['reason']})")
+
+    if report["needs_review"]:
+        print("\n=== NEEDS REVIEW (no alias entry) ===")
+        for grp in report["needs_review"]:
+            print(f"\n  {grp['key']}  ({grp['reason']})")
+            for d in grp["directories"]:
+                print(f"    [{d['type']}] {d['path']}  ({d['files']} files)")
+
+    print(
+        f"\nTotal moves: {total_moves}"
+        f"\nSame-target skips: {total_same}"
+        f"\nConflicts: {total_conflicts}"
+        f"\nNeeds-review groups: {len(report['needs_review'])}"
+    )
+    if report["dry_run"]:
+        print("\n(dry-run — pass --apply to execute)")
 
 
 def create_symlink(source, media_type):
@@ -1326,6 +1714,38 @@ def main():
         action="store_true",
         help="Like --report-dupes but emit JSON for downstream tooling",
     )
+    parser.add_argument(
+        "--merge-dupes",
+        action="store_true",
+        help="Merge duplicate show dirs. Dry-run by default; pass --apply to execute.",
+    )
+    parser.add_argument(
+        "--merge-dupes-json",
+        action="store_true",
+        help="Like --merge-dupes but emit JSON instead of a human-readable report.",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="With --merge-dupes: actually move symlinks (omit for dry-run).",
+    )
+    parser.add_argument(
+        "--aliases",
+        help="Path to aliases JSON/YAML file (see _load_aliases docstring for format).",
+    )
+    parser.add_argument(
+        "--prefer-year-form",
+        action="store_true",
+        help="When picking canonical, prefer dirs whose name contains '(YYYY)'.",
+    )
+    parser.add_argument(
+        "--canonical",
+        action="append",
+        default=[],
+        metavar="KEY=DIR_NAME",
+        help="Override canonical pick for a group (repeatable). KEY is matched "
+             "against the group's normalized show key.",
+    )
     args = parser.parse_args()
 
     if args.config:
@@ -1333,6 +1753,16 @@ def main():
 
     if args.report_dupes or args.report_dupes_json:
         report_duplicates(json_output=args.report_dupes_json)
+        return
+
+    if args.merge_dupes or args.merge_dupes_json:
+        merge_duplicates(
+            dry_run=not args.apply,
+            aliases_path=args.aliases,
+            prefer_year_form=args.prefer_year_form,
+            canonical_overrides=args.canonical,
+            json_output=args.merge_dupes_json,
+        )
         return
 
     state = load_state()
