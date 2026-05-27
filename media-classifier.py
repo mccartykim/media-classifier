@@ -1020,6 +1020,172 @@ def _canonical_show_dir(target_dir, candidate):
     return candidate
 
 
+def _count_media_files(d):
+    """Count media files anywhere under d."""
+    count = 0
+    try:
+        for f in d.rglob("*"):
+            if f.is_file() and f.suffix.lower() in MEDIA_EXTENSIONS:
+                count += 1
+    except OSError:
+        pass
+    return count
+
+
+def _season_dirs(show_dir):
+    """List 'Season N' / 'S0N ...' subdirs of show_dir as {season_num: path}.
+
+    Subdirs that don't parse as seasons are ignored — only collisions on the
+    same season number are interesting for the merge tool.
+    """
+    out = {}
+    try:
+        for child in show_dir.iterdir():
+            if not child.is_dir():
+                continue
+            if _is_season_dir(child.name):
+                n = _season_from_dir(child.name)
+                if n is not None:
+                    out.setdefault(n, []).append(child)
+    except OSError:
+        pass
+    return out
+
+
+def _season_collisions(dirs):
+    """Given a group's [(path, count), ...], return {season_num: [paths]} for
+    seasons that appear in >1 of the group's show dirs.
+    """
+    by_season = {}
+    for path, _ in dirs:
+        for n, paths in _season_dirs(path).items():
+            by_season.setdefault(n, []).extend(paths)
+    return {n: ps for n, ps in by_season.items() if len(ps) > 1}
+
+
+def _scan_dupe_groups():
+    """Group sibling directories under each TYPE_DIR by normalized show key.
+
+    Returns (within_type, cross_type):
+      within_type: {type_name: [(key, [(path, file_count), ...]), ...]}  groups with >1 dir
+      cross_type:  [(key, [(type_name, path, file_count), ...])]         keys spanning >1 type
+    """
+    within_type = {}
+    by_key_global = {}  # key -> [(type_name, path, count)]
+
+    for type_name, type_dir in TYPE_DIRS.items():
+        if not type_dir.is_dir():
+            continue
+        by_key = {}
+        try:
+            children = sorted(type_dir.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            key = _normalize_show_key(child.name)
+            if not key:
+                continue
+            count = _count_media_files(child)
+            by_key.setdefault(key, []).append((child, count))
+            by_key_global.setdefault(key, []).append((type_name, child, count))
+        groups = sorted(
+            ((k, v) for k, v in by_key.items() if len(v) > 1),
+            key=lambda kv: kv[0],
+        )
+        if groups:
+            within_type[type_name] = groups
+
+    cross_type = sorted(
+        (
+            (k, v) for k, v in by_key_global.items()
+            if len({t for t, _, _ in v}) > 1
+        ),
+        key=lambda kv: kv[0],
+    )
+    return within_type, cross_type
+
+
+def _suggest_canonical(entries):
+    """Pick the (path, file_count) entry with the most files; tiebreak alphabetically."""
+    return sorted(entries, key=lambda e: (-e[1], e[0].name))[0]
+
+
+def report_duplicates(json_output=False):
+    """Print a report of duplicate show directories across TYPE_DIRs.
+
+    Within-type groups: sibling dirs that collapse to the same _normalize_show_key.
+    Cross-type groups: same normalized key appears under more than one TYPE_DIR
+    (e.g. a show split between TV Shows/ and Anime/).
+    """
+    within_type, cross_type = _scan_dupe_groups()
+
+    if json_output:
+        out = {
+            "within_type": {
+                tn: [
+                    {
+                        "key": key,
+                        "canonical_suggested": _suggest_canonical(dirs)[0].name,
+                        "directories": [
+                            {"path": str(p), "files": c} for p, c in dirs
+                        ],
+                        "season_collisions": {
+                            str(n): [str(p) for p in ps]
+                            for n, ps in sorted(_season_collisions(dirs).items())
+                        },
+                    }
+                    for key, dirs in groups
+                ]
+                for tn, groups in within_type.items()
+            },
+            "cross_type": [
+                {
+                    "key": key,
+                    "directories": [
+                        {"type": t, "path": str(p), "files": c}
+                        for t, p, c in entries
+                    ],
+                }
+                for key, entries in cross_type
+            ],
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    total_within = 0
+    total_season_collisions = 0
+    for type_name, groups in within_type.items():
+        print(f"\n=== {type_name.upper()} ({TYPE_DIRS[type_name]}) ===")
+        for key, dirs in groups:
+            total_within += 1
+            canonical_path = _suggest_canonical(dirs)[0]
+            print(f"\nSHOW: {key}")
+            for path, count in dirs:
+                mark = "  ← suggested canonical" if path == canonical_path else ""
+                print(f"  {path.name}/  ({count} files){mark}")
+            collisions = _season_collisions(dirs)
+            for n, paths in sorted(collisions.items()):
+                total_season_collisions += 1
+                print(f"  ! Season {n} present in {len(paths)} dirs:")
+                for p in paths:
+                    print(f"      {p}")
+
+    if cross_type:
+        print("\n=== CROSS-TYPE DUPLICATES ===")
+        for key, entries in cross_type:
+            print(f"\nSHOW: {key}")
+            for t, p, c in entries:
+                print(f"  [{t}] {p.name}/  ({c} files)")
+
+    print(
+        f"\nTotal within-type duplicate groups: {total_within}"
+        f"\nTotal cross-type duplicate groups:  {len(cross_type)}"
+        f"\nTotal season-level collisions:      {total_season_collisions}"
+    )
+
+
 def create_symlink(source, media_type):
     """Create a symlink in the appropriate Jellyfin media directory.
 
@@ -1150,10 +1316,24 @@ def find_media_files(source_dir):
 def main():
     parser = argparse.ArgumentParser(description="Classify media files for Jellyfin")
     parser.add_argument("--config", help="Path to JSON config file")
+    parser.add_argument(
+        "--report-dupes",
+        action="store_true",
+        help="Scan TYPE_DIRs for duplicate show dirs (by _normalize_show_key) and exit",
+    )
+    parser.add_argument(
+        "--report-dupes-json",
+        action="store_true",
+        help="Like --report-dupes but emit JSON for downstream tooling",
+    )
     args = parser.parse_args()
 
     if args.config:
         load_config(args.config)
+
+    if args.report_dupes or args.report_dupes_json:
+        report_duplicates(json_output=args.report_dupes_json)
+        return
 
     state = load_state()
     processed = state["processed"]

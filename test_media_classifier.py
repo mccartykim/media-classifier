@@ -843,3 +843,154 @@ class TestShowNameNormalization:
         finally:
             mc.SHOW_ALIASES.clear()
             mc.SHOW_ALIASES.update(orig)
+
+
+class TestReportDupes:
+    """mc-imk: --report-dupes scans TYPE_DIRs and groups same-key sibling dirs."""
+
+    def _stage(self, tmp_path, layout):
+        """Build TYPE_DIRS under tmp_path. layout: {type_name: {show_dir: [files]}}.
+
+        Returns a saved-state restore callable so tests can scope mutations.
+        """
+        type_dirs = {}
+        for type_name, shows in layout.items():
+            base = tmp_path / type_name
+            base.mkdir()
+            type_dirs[type_name] = base
+            for show, files in shows.items():
+                d = base / show
+                d.mkdir()
+                for f in files:
+                    fp = d / f
+                    fp.parent.mkdir(parents=True, exist_ok=True)
+                    fp.write_text("v")
+        orig = mc.TYPE_DIRS.copy()
+        mc.TYPE_DIRS.clear()
+        mc.TYPE_DIRS.update(type_dirs)
+
+        def restore():
+            mc.TYPE_DIRS.clear()
+            mc.TYPE_DIRS.update(orig)
+
+        return restore
+
+    def test_no_dupes_emits_empty_groups(self, tmp_path, capsys):
+        restore = self._stage(tmp_path, {
+            "tv": {"Andor": ["a.mkv"], "For All Mankind": ["b.mkv"]},
+        })
+        try:
+            mc.report_duplicates()
+            out = capsys.readouterr().out
+            assert "Total within-type duplicate groups: 0" in out
+            assert "Total cross-type duplicate groups:  0" in out
+        finally:
+            restore()
+
+    def test_within_type_groups_collapsed_and_canonical_picked_by_filecount(
+        self, tmp_path, capsys,
+    ):
+        restore = self._stage(tmp_path, {
+            "tv": {
+                # Three SVU variants that normalize to the same key.
+                # The middle one has the most files → should be suggested canonical.
+                "Law And Order SVU":         ["a.mkv"],
+                "Law and Order SVU 1999":    ["b.mkv", "c.mkv", "d.mkv"],
+                "Law And Order Special Victims Unit": ["e.mkv"],
+                # A distinct show should NOT be grouped.
+                "Andor":                     ["x.mkv"],
+            },
+        })
+        try:
+            mc.report_duplicates()
+            out = capsys.readouterr().out
+            # SVU group present, Andor not in any group
+            assert "Law and Order SVU 1999" in out
+            assert "← suggested canonical" in out
+            # Canonical line should be on the highest-file-count dir
+            canon_line = next(
+                line for line in out.splitlines()
+                if "← suggested canonical" in line
+            )
+            assert "Law and Order SVU 1999" in canon_line
+            # The Special-Victims-Unit spelling normalizes differently, so it
+            # forms its own (1-element) bucket — no group printed for it.
+            assert "Special Victims Unit" not in canon_line
+            assert "Total within-type duplicate groups: 1" in out
+        finally:
+            restore()
+
+    def test_cross_type_detected_when_same_key_under_two_types(
+        self, tmp_path, capsys,
+    ):
+        restore = self._stage(tmp_path, {
+            "tv":    {"Undead Unluck": ["a.mkv"]},
+            "anime": {"Undead Unluck": ["b.mkv"]},
+        })
+        try:
+            mc.report_duplicates()
+            out = capsys.readouterr().out
+            assert "CROSS-TYPE DUPLICATES" in out
+            assert "[tv]" in out and "[anime]" in out
+            assert "Total cross-type duplicate groups:  1" in out
+        finally:
+            restore()
+
+    def test_json_output_structure(self, tmp_path, capsys):
+        restore = self._stage(tmp_path, {
+            "tv": {
+                "Andor": ["a.mkv"],
+                "Andor (2022)": ["b.mkv", "c.mkv"],
+            },
+        })
+        try:
+            mc.report_duplicates(json_output=True)
+            out = capsys.readouterr().out
+            data = json.loads(out)
+            assert "within_type" in data and "cross_type" in data
+            tv_groups = data["within_type"]["tv"]
+            assert len(tv_groups) == 1
+            grp = tv_groups[0]
+            assert grp["canonical_suggested"] == "Andor (2022)"
+            assert {d["path"].rsplit("/", 1)[-1] for d in grp["directories"]} == {
+                "Andor", "Andor (2022)",
+            }
+        finally:
+            restore()
+
+    def test_season_collision_flagged(self, tmp_path, capsys):
+        """Kim's clue 3: same season number under two dirs of one group must be flagged."""
+        # Two SVU dirs sharing the same normalized key, with overlapping Season 6.
+        restore = self._stage(tmp_path, {
+            "tv": {
+                "Law and Order SVU":      [],
+                "Law and Order SVU 1999": [],
+            },
+        })
+        try:
+            base = mc.TYPE_DIRS["tv"]
+            (base / "Law and Order SVU" / "Season 6").mkdir()
+            (base / "Law and Order SVU" / "Season 6" / "ep1.mkv").write_text("v")
+            (base / "Law and Order SVU 1999" / "Season 6").mkdir()
+            (base / "Law and Order SVU 1999" / "Season 6" / "ep2.mkv").write_text("v")
+            # Non-colliding season so the canonical-size tiebreak is unambiguous.
+            (base / "Law and Order SVU 1999" / "Season 7").mkdir()
+            (base / "Law and Order SVU 1999" / "Season 7" / "ep3.mkv").write_text("v")
+
+            mc.report_duplicates()
+            out = capsys.readouterr().out
+            assert "! Season 6 present in 2 dirs:" in out
+            assert "Total season-level collisions:      1" in out
+        finally:
+            restore()
+
+    def test_missing_type_dir_is_skipped(self, tmp_path, capsys):
+        # Stage only tv; reference a nonexistent anime/movie dir.
+        restore = self._stage(tmp_path, {"tv": {"Andor": ["a.mkv"]}})
+        try:
+            mc.TYPE_DIRS["anime"] = tmp_path / "does-not-exist"
+            mc.report_duplicates()  # must not raise
+            out = capsys.readouterr().out
+            assert "Total within-type duplicate groups: 0" in out
+        finally:
+            restore()
