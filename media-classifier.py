@@ -55,6 +55,12 @@ _llm_show_lock = threading.Lock()
 # canonical folder name. Keys are matched case-insensitively after normalization.
 SHOW_ALIASES = {}
 
+# Aliases loaded at classify-time from --aliases (the same file used by
+# --merge-dupes). Maps variant → {"canonical": ..., "type": ...}; consulted by
+# _canonical_show_dir to bridge cross-key collisions when normalization alone
+# can't (e.g. "Law and Order SVU" → "Law & Order Special Victims Unit (1999)").
+CLASSIFY_ALIASES = {}
+
 TYPE_DIRS = {
     "movie": MEDIA_BASE / "Movies",
     "tv": MEDIA_BASE / "TV Shows",
@@ -1119,7 +1125,8 @@ def _canonical_show_dir(target_dir, candidate):
     """Map a candidate show folder name to a canonical name.
 
     Applies SHOW_ALIASES first (so abbreviations like 'SVU' resolve), then
-    checks for an existing directory in target_dir whose normalized key
+    CLASSIFY_ALIASES (the --aliases file, which bridges cross-key collisions),
+    then checks for an existing directory in target_dir whose normalized key
     matches the candidate's — if so, reuses that name. If no exact match,
     checks for fuzzy-similar siblings and asks the LLM whether candidate
     is actually one of them. Otherwise returns the candidate unchanged.
@@ -1137,6 +1144,14 @@ def _canonical_show_dir(target_dir, candidate):
             if _normalize_show_key(alias_src) == key:
                 return alias_dst
 
+    # --aliases file lookup: variants → canonical. Resolve candidate first so
+    # the rest of the matching uses the canonical form.
+    if CLASSIFY_ALIASES:
+        spec = _alias_lookup(CLASSIFY_ALIASES, candidate)
+        if spec and spec.get("canonical"):
+            candidate = spec["canonical"]
+            key = _normalize_show_key(candidate)
+
     # Existing-dir lookup
     try:
         existing = [p.name for p in target_dir.iterdir() if p.is_dir()]
@@ -1148,6 +1163,12 @@ def _canonical_show_dir(target_dir, candidate):
             return candidate
         if _normalize_show_key(name) == key:
             return name
+        # Sibling may itself be a variant; resolve via aliases before comparing.
+        if CLASSIFY_ALIASES:
+            sib_spec = _alias_lookup(CLASSIFY_ALIASES, name)
+            if sib_spec and sib_spec.get("canonical"):
+                if _normalize_show_key(sib_spec["canonical"]) == key:
+                    return name
 
     # No exact normalized-key match found.
     # If there are similar-looking siblings, ask the LLM whether this is
@@ -2272,6 +2293,12 @@ def main():
             json_output=args.merge_episode_dupes_json,
         )
         return
+
+    # Make --aliases active at classify-time too (not just for --merge-dupes),
+    # so cross-key variants (e.g. Law and Order SVU) route into the canonical dir.
+    if args.aliases:
+        global CLASSIFY_ALIASES
+        CLASSIFY_ALIASES = _load_aliases(args.aliases)
 
     state = load_state()
     processed = state["processed"]

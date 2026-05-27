@@ -761,6 +761,69 @@ class TestShowNameNormalization:
             mc.SHOW_ALIASES.clear()
             mc.SHOW_ALIASES.update(orig)
 
+    def test_canonical_show_dir_classify_aliases_routes_to_existing(self, tmp_path):
+        """--aliases file lets a fresh variant route into the existing canonical dir."""
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        (target / "Law & Order Special Victims Unit (1999)").mkdir()
+
+        orig = mc.CLASSIFY_ALIASES.copy()
+        mc.CLASSIFY_ALIASES.clear()
+        mc.CLASSIFY_ALIASES["Law and Order SVU"] = {
+            "canonical": "Law & Order Special Victims Unit (1999)",
+            "type": "tv",
+        }
+        try:
+            assert mc._canonical_show_dir(target, "Law and Order SVU") == \
+                "Law & Order Special Victims Unit (1999)"
+            # Variant of the alias key also resolves
+            assert mc._canonical_show_dir(target, "Law.And.Order.SVU") == \
+                "Law & Order Special Victims Unit (1999)"
+        finally:
+            mc.CLASSIFY_ALIASES.clear()
+            mc.CLASSIFY_ALIASES.update(orig)
+
+    def test_canonical_show_dir_classify_aliases_resolves_sibling_variant(self, tmp_path):
+        """When the existing sibling is the variant and the candidate is canonical,
+        alias resolution still collapses them onto the existing dir.
+        """
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        # Sibling is the variant form (mc-imk Phase 2 hasn't renamed yet)
+        (target / "Law and Order SVU").mkdir()
+
+        orig = mc.CLASSIFY_ALIASES.copy()
+        mc.CLASSIFY_ALIASES.clear()
+        mc.CLASSIFY_ALIASES["Law and Order SVU"] = {
+            "canonical": "Law & Order Special Victims Unit (1999)",
+            "type": "tv",
+        }
+        try:
+            assert mc._canonical_show_dir(
+                target, "Law & Order Special Victims Unit (1999)"
+            ) == "Law and Order SVU"
+        finally:
+            mc.CLASSIFY_ALIASES.clear()
+            mc.CLASSIFY_ALIASES.update(orig)
+
+    def test_canonical_show_dir_classify_aliases_no_sibling_uses_canonical(self, tmp_path):
+        """Empty TYPE_DIR with an alias entry → new dir uses the canonical name."""
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+
+        orig = mc.CLASSIFY_ALIASES.copy()
+        mc.CLASSIFY_ALIASES.clear()
+        mc.CLASSIFY_ALIASES["Law and Order SVU"] = {
+            "canonical": "Law & Order Special Victims Unit (1999)",
+            "type": "tv",
+        }
+        try:
+            assert mc._canonical_show_dir(target, "Law and Order SVU") == \
+                "Law & Order Special Victims Unit (1999)"
+        finally:
+            mc.CLASSIFY_ALIASES.clear()
+            mc.CLASSIFY_ALIASES.update(orig)
+
     def test_duplicate_dirs_collapse_into_one(self, tmp_path):
         """The actual SVU bug: three release-style variants must land in one dir."""
         # First episode arrives — creates the canonical dir
@@ -803,6 +866,54 @@ class TestShowNameNormalization:
             mc.TYPE_DIRS.update(orig_type_dirs)
             mc.SHOW_ALIASES.clear()
             mc.SHOW_ALIASES.update(orig_aliases)
+
+    def test_create_symlink_classify_aliases_routes_into_existing(self, tmp_path):
+        """SVU dedup via --aliases file: variant file lands in the canonical dir."""
+        # Canonical dir already exists (e.g. created by an earlier classify run)
+        target = tmp_path / "TV Shows"
+        (target / "Law & Order Special Victims Unit (1999)" / "Season 13").mkdir(parents=True)
+
+        # Incoming file uses the SVU variant
+        src = tmp_path / "Law.And.Order.SVU.S13.COMPLETE"
+        src.mkdir()
+        video = src / "Law.And.Order.SVU.S13E18.mkv"
+        video.write_text("v")
+
+        orig_type_dirs = mc.TYPE_DIRS.copy()
+        orig_classify_aliases = mc.CLASSIFY_ALIASES.copy()
+        mc.TYPE_DIRS["tv"] = target
+        mc.CLASSIFY_ALIASES.clear()
+        mc.CLASSIFY_ALIASES["Law and Order SVU"] = {
+            "canonical": "Law & Order Special Victims Unit (1999)",
+            "type": "tv",
+        }
+        try:
+            assert mc.create_symlink(str(video), "tv") is True
+            show_dirs = sorted(p.name for p in target.iterdir() if p.is_dir())
+            assert show_dirs == ["Law & Order Special Victims Unit (1999)"], show_dirs
+        finally:
+            mc.TYPE_DIRS.update(orig_type_dirs)
+            mc.CLASSIFY_ALIASES.clear()
+            mc.CLASSIFY_ALIASES.update(orig_classify_aliases)
+
+    def test_create_symlink_no_aliases_fresh_dir(self, tmp_path):
+        """Fresh TYPE_DIR with no siblings → new dir uses the cleaned candidate."""
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+
+        src = tmp_path / "Better.Call.Saul.S01"
+        src.mkdir()
+        video = src / "Better.Call.Saul.S01E01.mkv"
+        video.write_text("v")
+
+        orig_type_dirs = mc.TYPE_DIRS.copy()
+        mc.TYPE_DIRS["tv"] = target
+        try:
+            assert mc.create_symlink(str(video), "tv") is True
+            show_dirs = [p.name for p in target.iterdir() if p.is_dir()]
+            assert len(show_dirs) == 1, show_dirs
+        finally:
+            mc.TYPE_DIRS.update(orig_type_dirs)
 
     def test_punct_and_case_variants_collapse_without_alias(self, tmp_path):
         """No alias needed for pure case/punctuation/year differences."""
