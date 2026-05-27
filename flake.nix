@@ -14,7 +14,7 @@
   in {
     packages = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
-      classifierPython = pkgs.python3.withPackages (ps: [ps.anitopy]);
+      classifierPython = pkgs.python3.withPackages (ps: [ps.anitopy ps.rapidfuzz]);
     in {
       default = pkgs.stdenv.mkDerivation {
         pname = "media-classifier";
