@@ -361,6 +361,61 @@ class TestFullPipeline:
         assert signals["method"] == "fast_path"
 
 
+class TestCategoryOverrides:
+    """categoryOverrides config pins a show to a category, checked before
+    fast-path/AniList/LLM scoring so the pin survives rescans."""
+
+    def test_override_by_show_dir(self, empty_state, monkeypatch):
+        monkeypatch.setattr(mc, "CATEGORY_OVERRIDES", {"ONE PIECE": "anime"})
+        media_type, conf, signals = mc.classify(
+            "ONE PIECE/Season 01/ONE PIECE - 01.mkv", "/fake/onepiece.mkv", empty_state
+        )
+        assert media_type == "anime"
+        assert signals["method"] == "override"
+
+    def test_override_by_cleaned_title(self, empty_state, monkeypatch):
+        monkeypatch.setattr(mc, "CATEGORY_OVERRIDES", {"Gachiakuta": "anime"})
+        media_type, conf, signals = mc.classify(
+            "Gachiakuta/Gachiakuta - 01 [SubsPlease].mkv", "/fake/gachiakuta.mkv", empty_state
+        )
+        assert media_type == "anime"
+        assert signals["method"] == "override"
+
+    def test_override_case_insensitive(self, empty_state, monkeypatch):
+        monkeypatch.setattr(mc, "CATEGORY_OVERRIDES", {"one piece": "anime"})
+        media_type, conf, signals = mc.classify(
+            "ONE PIECE/Season 01/ONE PIECE - 01.mkv", "/fake/onepiece.mkv", empty_state
+        )
+        assert media_type == "anime"
+
+    def test_override_not_matching_falls_through(self, empty_state, monkeypatch):
+        # An unrelated override must not affect a show that would fast-path to tv.
+        monkeypatch.setattr(mc, "CATEGORY_OVERRIDES", {"ONE PIECE": "anime"})
+        media_type, conf, signals = mc.classify(
+            "Breaking.Bad.S01E05.720p.BluRay.mkv", "/fake/file.mkv", empty_state
+        )
+        assert media_type == "tv"
+        assert signals["method"] == "fast_path"
+
+    def test_override_beats_fast_path(self, empty_state, monkeypatch):
+        # A fansub anime filename pinned to tv must be tv — override precedes fast-path.
+        monkeypatch.setattr(mc, "CATEGORY_OVERRIDES", {"Pinned TV": "tv"})
+        media_type, conf, signals = mc.classify(
+            "Pinned TV/[SubsPlease] Jujutsu Kaisen - 01 (1080p).mkv",
+            "/fake/file.mkv", empty_state,
+        )
+        assert media_type == "tv"
+        assert signals["method"] == "override"
+
+    def test_override_unknown_type_ignored(self, empty_state, monkeypatch):
+        # A bogus override type must not crash or misclassify — falls through.
+        monkeypatch.setattr(mc, "CATEGORY_OVERRIDES", {"ONE PIECE": "documentary"})
+        media_type, conf, signals = mc.classify(
+            "ONE PIECE/Season 01/ONE PIECE - 01.mkv", "/fake/onepiece.mkv", empty_state
+        )
+        assert media_type != "override"
+
+
 # =============================================================================
 # State management
 # =============================================================================

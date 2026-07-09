@@ -10,6 +10,7 @@
     sourceDirs = cfg.sourceDirs;
     mediaBase = cfg.mediaBase;
     categories = cfg.categories;
+    categoryOverrides = cfg.categoryOverrides;
     ollamaHost = cfg.ollamaHost;
     ollamaModel = cfg.ollamaModel;
     ffprobePath = "${pkgs.ffmpeg}/bin/ffprobe";
@@ -43,6 +44,21 @@ in {
         anime = "Anime";
       };
       description = "Mapping of category keys to directory names under mediaBase.";
+    };
+
+    categoryOverrides = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.enum ["movie" "tv" "anime"]);
+      default = {};
+      example = {"ONE PIECE" = "anime"; "Gachiakuta" = "anime";};
+      description = ''
+        Pin specific shows to a category, overriding the classifier's
+        heuristics/AniList/LLM scoring. Keys are matched case-insensitively
+        against the show-directory name (first path component of the source
+        tree) and the parsed title. Use this for shows the classifier
+        mis-bins (e.g. anime filed as TV): the pin survives rescans, which a
+        manual move would not (the classifier re-creates every symlink at its
+        stored type each run, and a source-path change reclassifies all).
+      '';
     };
 
     ollamaHost = lib.mkOption {

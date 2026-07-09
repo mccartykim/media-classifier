@@ -61,6 +61,16 @@ SHOW_ALIASES = {}
 # can't (e.g. "Law and Order SVU" → "Law & Order Special Victims Unit (1999)").
 CLASSIFY_ALIASES = {}
 
+# Explicit per-show category pins (show name → "movie"|"tv"|"anime"), loaded
+# from config. Checked in classify() before any heuristics/AniList/LLM scoring
+# so a pinned show lands in its category and STAYS there across rescans — the
+# classifier re-creates every symlink at its stored type each run, and a
+# source-path change (e.g. the media-drive → NFS migration) wipes the
+# "processed" state and reclassifies everything, which would otherwise revert
+# a manual move. Matched case-insensitively against the show-directory name
+# (first path component of the source-relative path) and the parsed title.
+CATEGORY_OVERRIDES = {}
+
 TYPE_DIRS = {
     "movie": MEDIA_BASE / "Movies",
     "tv": MEDIA_BASE / "TV Shows",
@@ -105,7 +115,7 @@ def has_tv_pattern(name):
 
 def load_config(config_path):
     """Load JSON config file and apply settings to globals."""
-    global SOURCE_DIRS, MEDIA_BASE, TYPE_DIRS, OLLAMA_HOST, OLLAMA_MODEL, FFPROBE_PATH, SHOW_ALIASES
+    global SOURCE_DIRS, MEDIA_BASE, TYPE_DIRS, OLLAMA_HOST, OLLAMA_MODEL, FFPROBE_PATH, SHOW_ALIASES, CATEGORY_OVERRIDES
 
     with open(config_path) as f:
         cfg = json.load(f)
@@ -130,6 +140,8 @@ def load_config(config_path):
         FFPROBE_PATH = cfg["ffprobePath"]
     if "showAliases" in cfg:
         SHOW_ALIASES = dict(cfg["showAliases"])
+    if "categoryOverrides" in cfg:
+        CATEGORY_OVERRIDES = {str(k): str(v) for k, v in cfg["categoryOverrides"].items()}
 
 
 # =============================================================================
@@ -747,6 +759,16 @@ def classify(name, filepath, state):
     """
     # Stage 1: Parse filename
     info = parse_filename(name)
+
+    # Stage 1b: Explicit category override — config pins take precedence over
+    # all heuristics/AniList/LLM scoring (see CATEGORY_OVERRIDES docstring).
+    if CATEGORY_OVERRIDES:
+        _title = (info.get("cleaned_title") or "").strip().lower()
+        _showdir = (Path(name).parts[0] if Path(name).parts else "").strip().lower()
+        for _key, _otype in CATEGORY_OVERRIDES.items():
+            _k = _key.strip().lower()
+            if _k and (_k == _showdir or _k == _title) and _otype in TYPE_DIRS:
+                return _otype, "override", {"method": "override", "key": _key}
 
     # Stage 2: Fast-path
     media_type, confidence = classify_fast_path(info)
