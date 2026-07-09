@@ -2233,8 +2233,9 @@ class TestLLMShowVerification:
             result = mc._llm_verify_new_show("Frieren", ["Sousou no Frieren"])
             assert result == "Frieren"
 
-    def test_llm_failure_falls_through_to_new(self, tmp_path):
-        """When LLM is unreachable, falls through to NEW and logs to review log."""
+    def test_llm_failure_defers_item(self, tmp_path):
+        """When LLM is unreachable, raises _LLMVerifyUnavailable (defer + retry)
+        and logs to review log — does NOT fall through to a duplicate NEW dir."""
         cache_file = tmp_path / "cache.json"
         review_log = tmp_path / "review.log"
 
@@ -2243,15 +2244,16 @@ class TestLLMShowVerification:
              mock.patch.object(mc, "OLLAMA_HOST", "http://localhost:11434"), \
              mock.patch.object(mc, "OLLAMA_MODEL", "test-model"), \
              mock.patch("urllib.request.urlopen", side_effect=Exception("connection refused")):
-            result = mc._llm_verify_new_show("Frieren", ["Sousou no Frieren"])
-            assert result == "Frieren"
+            with pytest.raises(mc._LLMVerifyUnavailable):
+                mc._llm_verify_new_show("Frieren", ["Sousou no Frieren"])
             assert review_log.exists()
             content = review_log.read_text()
             assert "llm_error" in content
             assert "Frieren" in content
 
-    def test_llm_unparseable_response_falls_through(self, tmp_path):
-        """Unparseable LLM response falls through to NEW and logs."""
+    def test_llm_unparseable_response_defers_item(self, tmp_path):
+        """Unparseable LLM response raises _LLMVerifyUnavailable (defer + retry)
+        and logs — does NOT fall through to a duplicate NEW dir."""
         cache_file = tmp_path / "cache.json"
         review_log = tmp_path / "review.log"
 
@@ -2268,8 +2270,8 @@ class TestLLMShowVerification:
             mock_resp.__exit__ = mock.MagicMock(return_value=False)
             mock_urlopen.return_value = mock_resp
 
-            result = mc._llm_verify_new_show("Frieren", ["Sousou no Frieren"])
-            assert result == "Frieren"
+            with pytest.raises(mc._LLMVerifyUnavailable):
+                mc._llm_verify_new_show("Frieren", ["Sousou no Frieren"])
             assert review_log.exists()
             content = review_log.read_text()
             assert "llm_unparseable" in content
@@ -2294,7 +2296,7 @@ class TestLLMShowVerification:
         cache_file = tmp_path / "cache.json"
         review_log = tmp_path / "review.log"
         cache_file.write_text(json.dumps({
-            "the wire|breaking bad 2008": {"verdict": "NEW"},
+            "the wire|breaking bad": {"verdict": "NEW"},
         }))
 
         with mock.patch.object(mc, "LLM_SHOW_CACHE_FILE", cache_file), \
@@ -2367,3 +2369,47 @@ class TestLLMShowVerification:
             assert "Sousou no Frieren" in called_siblings
             assert "Frieren Beyond Journey's End" in called_siblings
             assert "Attack on Titan" not in called_siblings
+
+
+class TestDeferOnLLMVerifyFailure:
+    """When the show-dedup LLM fails, main() must NOT write the item to
+    state.processed (so it retries next run) instead of marooning it in a
+    duplicate show dir."""
+
+    def test_llm_verify_failure_defers_item_out_of_processed(self, tmp_path):
+        src = tmp_path / "incoming"
+        src.mkdir()
+        media = src / "Columbo S10.1 (1990)" / "Pilot.mkv"
+        media.parent.mkdir()
+        media.write_text("x")
+        media_base = tmp_path / "media"
+        (media_base / "TV Shows").mkdir(parents=True)
+
+        config = {
+            "sourceDirs": [str(src)],
+            "mediaBase": str(media_base),
+            "categories": {"tv": "TV Shows"},
+            "ollamaHost": "http://localhost:11434",
+            "ollamaModel": "test-model",
+            "ffprobePath": "ffprobe",
+        }
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(config))
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+
+        with mock.patch.object(mc, "STATE_DIR", state_dir), \
+             mock.patch.object(mc, "STATE_FILE", state_dir / "state.json"), \
+             mock.patch.object(mc, "LLM_SHOW_CACHE_FILE", state_dir / "cache.json"), \
+             mock.patch.object(mc, "NEEDS_CLASSIFY_REVIEW_LOG", state_dir / "review.log"), \
+             mock.patch.object(mc, "classify", return_value=("tv", "high", {"method": "test"})), \
+             mock.patch.object(mc, "create_symlink", side_effect=mc._LLMVerifyUnavailable("Columbo S10.1 (1990)")):
+            testargs = ["media-classifier", "--config", str(config_path)]
+            with mock.patch.object(sys, "argv", testargs):
+                mc.main()
+
+        state = json.loads((state_dir / "state.json").read_text())
+        # The item must NOT be recorded as processed — it should retry next run.
+        assert str(media) not in state["processed"], \
+            "LLM-deferred item was marked processed (would permanently maroon it)"

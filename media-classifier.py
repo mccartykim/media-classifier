@@ -1110,11 +1110,19 @@ def _log_needs_review(candidate, siblings, reason):
         pass
 
 
+class _LLMVerifyUnavailable(Exception):
+    """The show-dedup LLM call failed (timeout/unparseable). The caller must defer
+    the item — leave it out of state.processed so it retries next run, instead of
+    creating a duplicate show dir and permanently marooning it there."""
+
+
 def _llm_verify_new_show(candidate, siblings):
     """Ask the LLM whether candidate is actually one of the existing sibling shows.
 
     Returns the sibling name to reuse (MATCH N) or the original candidate (NEW).
-    On LLM failure, logs to needs-classify-review.log and returns candidate unchanged.
+    On LLM failure, logs to needs-classify-review.log and raises
+    _LLMVerifyUnavailable so the item is deferred (retried) rather than placed
+    in a duplicate show dir.
     """
     # Build cache key: (normalized-candidate, sorted-tuple-of-sibling-normalized-keys)
     cand_key = _normalize_show_key(candidate)
@@ -1140,7 +1148,7 @@ def _llm_verify_new_show(candidate, siblings):
         "one line:\n"
         '  MATCH <number>    if it is the same show as that entry (e.g., "MATCH 2")\n'
         "  NEW              if it is a different show\n\n"
-        "If unsure, reply NEW. Do not invent shows that are not in the list."
+        "If unsure, reply NEW. Do not invent shows that are not in the list. /no_think"
     )
 
     with _llm_show_lock:
@@ -1156,12 +1164,12 @@ def _llm_verify_new_show(candidate, siblings):
                 data=payload,
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read())
             text = data.get("response", "").strip()
         except Exception as e:
             _log_needs_review(candidate, siblings, f"llm_error: {e}")
-            return candidate
+            raise _LLMVerifyUnavailable(candidate)
 
     # Parse response
     match = re.match(r"^MATCH\s+(\d+)\s*$", text, re.IGNORECASE)
@@ -1184,7 +1192,7 @@ def _llm_verify_new_show(candidate, siblings):
 
     # Unparseable response
     _log_needs_review(candidate, siblings, f"llm_unparseable: {text!r}")
-    return candidate
+    raise _LLMVerifyUnavailable(candidate)
 
 
 def _canonical_show_dir(target_dir, candidate):
@@ -2413,7 +2421,19 @@ def main():
 
             print(f"  [{media_type.upper()}] {name} (confidence={confidence}, method={signals.get('method', '?')})")
 
-            if create_symlink(filepath, media_type):
+            try:
+                created = create_symlink(filepath, media_type)
+            except _LLMVerifyUnavailable:
+                # LLM couldn't verify which show dir this belongs in. Leave the
+                # item unprocessed so it retries next run instead of landing in a
+                # duplicate show dir forever.
+                # ponytail: no circuit breaker — a down ollama makes runs slow
+                # (up to 30s per ambiguous item) but not broken; add a per-run
+                # failure cap if runs ever overrun the 1-min timer.
+                stats["failed"] += 1
+                print(f"  [DEFER] LLM unavailable to verify show dir; retry next run: {name}")
+                continue
+            if created:
                 processed[key] = {
                     "type": media_type,
                     "confidence": confidence,
