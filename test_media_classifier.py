@@ -731,6 +731,29 @@ class TestShowNameNormalization:
         }
         assert len(keys) == 1, f"expected all keys to match, got {keys}"
 
+    def test_normalize_key_expands_abbreviations_to_spelled_out(self):
+        """Abbreviated and spelled-out titles must collapse to one key.
+
+        Regression for the real prod dupe: 'Law and Order SVU' and
+        'Law & Order Special Victims Unit (1999)' landed in separate dirs
+        because the normalizer left 'svu' != 'special victims unit'.
+        The abbreviation expander bridges them without a manual aliases file.
+        """
+        assert mc._normalize_show_key("Law and Order SVU") == \
+            mc._normalize_show_key("Law & Order Special Victims Unit (1999)")
+        assert mc._normalize_show_key("Law and Order SVU") == \
+            mc._normalize_show_key("Law And Order Special Victims Unit")
+        # And the canonical key is the spelled-out form, not the abbreviation
+        assert mc._normalize_show_key("Law and Order SVU") == \
+            "law and order special victims unit"
+
+    def test_normalize_key_other_abbreviations_collapse(self):
+        """A couple more abbreviation bridges the expander ships with."""
+        assert mc._normalize_show_key("Star Trek TNG") == \
+            mc._normalize_show_key("Star Trek The Next Generation")
+        assert mc._normalize_show_key("Better Call Saul") == \
+            mc._normalize_show_key("BCS")
+
     def test_canonical_show_dir_reuses_existing(self, tmp_path):
         target = tmp_path / "TV Shows"
         target.mkdir()

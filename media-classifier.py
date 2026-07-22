@@ -963,17 +963,47 @@ _RELEASE_BOUNDARY_TOKENS = (
 )
 
 
+# Well-known title abbreviations → canonical spelled-out form, applied during
+# normalization so abbreviated and spelled-out releases collapse to one dedup
+# key (e.g. "Law and Order SVU" == "Law & Order Special Victims Unit").
+# Word-boundary, case-insensitive — callers pass already-lowercased input.
+# Keep this conservative: only abbreviations unlikely to appear as ordinary
+# words (alphanumeric caps clusters like SVU/TNG/DS9). Risky ones (e.g. "GOT")
+# stay in the aliases file instead, where a human vouches for the mapping.
+_SHOW_ABBREVIATIONS = [
+    (re.compile(r"\bsvu\b"), "special victims unit"),
+    (re.compile(r"\btng\b"), "the next generation"),
+    (re.compile(r"\bds9\b"), "deep space nine"),
+    (re.compile(r"\bvoy\b"), "voyager"),
+    (re.compile(r"\bbcs\b"), "better call saul"),
+]
+
+
+def _expand_abbreviations(s):
+    """Expand known title abbreviations to their spelled-out canonical form.
+
+    Operates on a lowercased string; safe to call multiple times (expansions
+    don't re-trigger). Returns the string with abbreviations expanded.
+    """
+    if not s:
+        return s
+    for pattern, expansion in _SHOW_ABBREVIATIONS:
+        s = pattern.sub(expansion, s)
+    return s
+
+
 def _normalize_show_key(name):
     """Produce a comparison key for show-name dedup.
 
-    Collapses case, '&'/'and', year suffixes, punctuation, and trailing
-    release-tag noise so that 'Law & Order Special Victims Unit (1999)' and
-    'Law and Order SVU Season 13 Complete WEB x264' collapse to comparable
-    forms (modulo abbreviations, which SHOW_ALIASES handles).
+    Collapses case, '&'/'and', year suffixes, punctuation, known title
+    abbreviations, and trailing release-tag noise so that
+    'Law & Order Special Victims Unit (1999)' and 'Law and Order SVU Season 13
+    Complete WEB x264' collapse to the same key.
     """
     if not name:
         return ""
     s = name.lower()
+    s = _expand_abbreviations(s)
     s = s.replace("&", " and ")
     # Strip parenthesized or bare 4-digit years
     s = re.sub(r"\((?:19|20)\d{2}\)", " ", s)
