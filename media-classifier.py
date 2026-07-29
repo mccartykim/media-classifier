@@ -763,11 +763,25 @@ def classify(name, filepath, state):
     # Stage 1b: Explicit category override — config pins take precedence over
     # all heuristics/AniList/LLM scoring (see CATEGORY_OVERRIDES docstring).
     if CATEGORY_OVERRIDES:
-        _title = (info.get("cleaned_title") or "").strip().lower()
-        _showdir = (Path(name).parts[0] if Path(name).parts else "").strip().lower()
+        # Normalize for matching: lowercase, dots→spaces, collapse whitespace.
+        # parse_filename occasionally leaves residue in cleaned_title (e.g.
+        # "Gachiakuta S01E07.A Score to Settle" when a single-letter episode
+        # token foils the season stripper; this is Python-version-dependent), and
+        # source show-dir names use dots ("ONE.PIECE.S02...HdHub"). An exact
+        # match misses both, so match on the normalized title/show-dir equality
+        # OR the normalized title/show-dir starting with the key at a word
+        # boundary — robust to residue and dotted forms without over-matching
+        # unrelated shows whose titles merely contain the key mid-sentence.
+        def _norm(s):
+            return " ".join(s.lower().replace(".", " ").split())
+
+        _t = _norm((info.get("cleaned_title") or "").strip())
+        _s = _norm((Path(name).parts[0] if Path(name).parts else "").strip())
         for _key, _otype in CATEGORY_OVERRIDES.items():
-            _k = _key.strip().lower()
-            if _k and (_k == _showdir or _k == _title) and _otype in TYPE_DIRS:
+            _k = _norm(_key.strip())
+            if not _k or _otype not in TYPE_DIRS:
+                continue
+            if _k == _t or _k == _s or _t.startswith(_k + " ") or _s.startswith(_k + " "):
                 return _otype, "override", {"method": "override", "key": _key}
 
     # Stage 2: Fast-path

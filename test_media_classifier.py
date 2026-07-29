@@ -415,6 +415,43 @@ class TestCategoryOverrides:
         )
         assert media_type != "override"
 
+    def test_override_title_with_residue(self, empty_state, monkeypatch):
+        # parse_filename occasionally leaves season/episode residue in
+        # cleaned_title (Python-version-dependent, e.g. a single-letter episode
+        # token: "Gachiakuta S01E07.A Score to Settle"). The override must still
+        # match by normalizing + prefix match at a word boundary.
+        monkeypatch.setattr(mc, "CATEGORY_OVERRIDES", {"Gachiakuta": "anime"})
+        media_type, conf, signals = mc.classify(
+            "Gachiakuta.S01.1080p.CR.WEB-DL.AAC2.0.H.264-VARYG/"
+            "Gachiakuta.S01E07.A.Score.to.Settle.1080p.CR.WEB-DL.AAC2.0.H.264-VARYG.mkv",
+            "/fake/gachiakuta-e07.mkv", empty_state,
+        )
+        assert media_type == "anime"
+        assert signals["method"] == "override"
+
+    def test_override_dotted_show_dir(self, empty_state, monkeypatch):
+        # Source show-dir names use dots ("ONE.PIECE.S02...HdHub"); the override
+        # key "ONE PIECE" must match after dot→space normalization.
+        monkeypatch.setattr(mc, "CATEGORY_OVERRIDES", {"ONE PIECE": "anime"})
+        media_type, conf, signals = mc.classify(
+            "ONE.PIECE.S02.1080p.NF.WEB-DL.DDP5.1.Atmos.H.264-HdHub/"
+            "ONE.PIECE.S02E01.THE.BEGINNING.1080p.NF.WEB-DL.DDP5.1.Atmos.H.264.mkv",
+            "/fake/onepiece-e01.mkv", empty_state,
+        )
+        assert media_type == "anime"
+        assert signals["method"] == "override"
+
+    def test_override_no_false_positive_on_substring(self, empty_state, monkeypatch):
+        # A key must not match a title that merely contains it mid-sentence
+        # ("The Gachiakuta Files" is a different show) — only title/show-dir
+        # equality or prefix-at-word-boundary matches.
+        monkeypatch.setattr(mc, "CATEGORY_OVERRIDES", {"Gachiakuta": "anime"})
+        media_type, conf, signals = mc.classify(
+            "The Gachiakuta Files/Season 01/The Gachiakuta Files - 01.mkv",
+            "/fake/files.mkv", empty_state,
+        )
+        assert media_type != "anime" or signals.get("method") != "override"
+
 
 # =============================================================================
 # State management
