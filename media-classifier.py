@@ -725,6 +725,7 @@ def classify_llm(info, evidence, scores, reasons):
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
+            "think": False,
             "format": {"type": "object", "properties": {"category": {"type": "string", "enum": ["anime", "tv", "movie"]}}, "required": ["category"]},
             "options": {"temperature": 0.1, "num_predict": 50},
         }).encode()
@@ -1157,6 +1158,7 @@ def _llm_verify_new_show(candidate, siblings):
                 "model": OLLAMA_MODEL,
                 "prompt": prompt,
                 "stream": False,
+                "think": False,
                 "options": {"temperature": 0.1, "num_predict": 30},
             }).encode()
             req = urllib.request.Request(
