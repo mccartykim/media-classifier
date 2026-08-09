@@ -2413,3 +2413,53 @@ class TestDeferOnLLMVerifyFailure:
         # The item must NOT be recorded as processed — it should retry next run.
         assert str(media) not in state["processed"], \
             "LLM-deferred item was marked processed (would permanently maroon it)"
+
+    def test_llm_verify_failure_on_skipped_item_does_not_crash(self, tmp_path):
+        """An already-processed item whose show dir no longer exact-matches must
+        not crash the service when the LLM is unavailable."""
+        src = tmp_path / "incoming"
+        src.mkdir()
+        media = src / "Columbo S10.1 (1990)" / "Pilot.mkv"
+        media.parent.mkdir()
+        media.write_text("x")
+        media_base = tmp_path / "media"
+        canon_dir = media_base / "TV Shows" / "Columbo (1968)" / "Season 10"
+        canon_dir.mkdir(parents=True)
+
+        config = {
+            "sourceDirs": [str(src)],
+            "mediaBase": str(media_base),
+            "categories": {"tv": "TV Shows"},
+            "ollamaHost": "http://localhost:11434",
+            "ollamaModel": "test-model",
+            "ffprobePath": "ffprobe",
+        }
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(config))
+
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        state_file = state_dir / "state.json"
+        state_file.write_text(json.dumps({
+            "version": 2,
+            "anilist_cache": {},
+            "wikipedia_cache": {},
+            "processed": {
+                str(media): {"type": "tv", "confidence": "high", "signals": {}, "classifier_version": 2},
+            },
+        }))
+
+        with mock.patch.object(mc, "STATE_DIR", state_dir), \
+             mock.patch.object(mc, "STATE_FILE", state_file), \
+             mock.patch.object(mc, "LLM_SHOW_CACHE_FILE", state_dir / "cache.json"), \
+             mock.patch.object(mc, "NEEDS_CLASSIFY_REVIEW_LOG", state_dir / "review.log"), \
+             mock.patch.object(mc, "classify", return_value=("tv", "high", {"method": "test"})), \
+             mock.patch.object(mc, "create_symlink", side_effect=mc._LLMVerifyUnavailable("Columbo S10.1 (1990)")):
+            testargs = ["media-classifier", "--config", str(config_path)]
+            with mock.patch.object(sys, "argv", testargs):
+                mc.main()  # must not raise
+
+        state = json.loads(state_file.read_text())
+        # Already-processed item should stay processed (we only deferred the
+        # subtitle check, not the whole item).
+        assert str(media) in state["processed"]

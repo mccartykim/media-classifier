@@ -2397,7 +2397,14 @@ def main():
                 # Still check for new companion subtitle files
                 existing_type = existing.get("type")
                 if existing_type and existing_type in TYPE_DIRS:
-                    create_symlink(filepath, existing_type)
+                    try:
+                        create_symlink(filepath, existing_type)
+                    except _LLMVerifyUnavailable:
+                        # Already-processed item no longer resolves to an exact
+                        # show dir (e.g. recovery moved symlinks). Defer the
+                        # subtitle check rather than crash; a later version bump
+                        # or alias will reconcile it.
+                        pass
                 stats["skipped"] += 1
                 continue
 
