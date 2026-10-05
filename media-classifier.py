@@ -1089,6 +1089,21 @@ def _llm_write_paths(show_name, files):
     return paths
 
 
+def _looks_nonstandard(source):
+    """Cheap pre-filter: could this layout hide episode titles from Jellyfin?
+
+    Year-based seasons ('Mythbusters 2004', '2004x06') are the common case.
+    Keeps the LLM path writer off standard 'Season 1/S01E01' libraries, where
+    rewriting would churn existing links for no benefit. Jev still makes the
+    final call for the flagged shows.
+    """
+    if _year_season_from_dir(source.parent.name)[1] is not None:
+        return True
+    if TV_YEAR_XN_RE.search(source.name):
+        return True
+    return False
+
+
 def _llm_target_relpath(show_name, source):
     """Return an LLM-written path for `source` (relative to the show dir), or None.
 
@@ -1096,6 +1111,8 @@ def _llm_target_relpath(show_name, source):
     nonstandard. Only then do we spend a chat-model call to write paths.
     """
     if not _jev_api_key():
+        return None
+    if not _looks_nonstandard(source):
         return None
 
     cache_key = _normalize_show_key(show_name)
