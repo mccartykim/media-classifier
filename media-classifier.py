@@ -1022,10 +1022,12 @@ def _dir_media_files(directory):
     return out
 
 
-def _llm_write_paths(show_name, files):
+def _llm_write_paths(show_name, files, folder_name=None):
     """Ask the Ollama chat model to write Jellyfin-relative paths for `files`.
 
-    `files` is a list of source Paths (one season/pack directory). Returns
+    `files` is a list of source Paths (one season/pack directory);
+    `folder_name` is that directory's name, given to the model as context when
+    the season is encoded in the folder rather than the filename. Returns
     {source_name: "Season N/Show - SxxEyy - Title.ext"} relative to the show
     folder, or {} on failure. Cached by show + sorted file names so repeat
     classifier runs (and the already-processed path) don't re-bill the model.
@@ -1045,13 +1047,17 @@ def _llm_write_paths(show_name, files):
         )
 
     prompt = (
-        f"You are organizing the TV show {show_name!r} for a Jellyfin library.\n"
-        "For each file below, write a Jellyfin-friendly path RELATIVE TO THE SHOW "
+        f"You are organizing the TV show {show_name!r} for a Jellyfin library. "
+        + (f"The files all live in the folder {folder_name!r}. " if folder_name else "")
+        + "For each file below, write a Jellyfin-friendly path RELATIVE TO THE SHOW "
         "DIRECTORY, in this exact shape:\n"
         "  Season <season>/<Show name> - S<season>E<episode> - <Episode title>.<ext>\n"
-        "Take the episode title from the filename (the text after the season/episode "
-        "marker). Keep the season and episode numbers the filename encodes; do NOT "
-        "renumber them (e.g. '2004x06' becomes season 2004 episode 6 -> S2004E06). "
+        "Preserve the episode title from the filename or folder; the metadata "
+        "provider (not you) supplies the authoritative title/description, so the "
+        "critical output is a correct season/episode marker. Take the season and "
+        "episode from the filename or the folder name; keep the numbers they encode "
+        "and do NOT renumber them (e.g. '2004x06' -> season 2004 episode 6 -> "
+        "S2004E06). "
         "A file whose name marks it as a Special (e.g. '2016xSpecial 8') is a "
         "special: put it in Season 0 as S00E<number> (-> 'Season 0/Show - S00E08 - X'). "
         "Every file must get a distinct season/episode pair; never assign two files "
@@ -1166,7 +1172,7 @@ def _llm_target_relpath(show_name, source):
     files = _dir_media_files(source.parent)
     if not files:
         return None
-    paths = _llm_write_paths(show_name, files)
+    paths = _llm_write_paths(show_name, files, source.parent.name)
     return paths.get(source.name)
 
 
