@@ -1265,6 +1265,10 @@ _BONUS_DIRS = {
 
 # Pattern matching "S08 1080p Bluray", "S01 480p DVD", etc.
 _SEASON_PREFIX_RE = re.compile(r"^S(\d{1,2})\b", re.IGNORECASE)
+# "Season 6", "Season 6 - Cell Games Saga", "Season 3: Frieza Saga". The
+# separator must be whitespace, so a pack name like "Season 1-5" is NOT a
+# season directory.
+_SEASON_WORD_RE = re.compile(r"^Season\s+(\d+)(?:\s*[:.]|\s+[-\u2013\u2014]|\s*$)", re.IGNORECASE)
 
 
 def _is_bonus_dir(name):
@@ -1282,9 +1286,9 @@ def _is_bonus_dir(name):
 def _is_season_dir(name):
     """Check if a directory name is a season directory.
 
-    Matches: "Season 1", "S08 1080p Bluray", "S01 480p DVD", etc.
+    Matches: "Season 1", "Season 6 - Cell Games Saga", "S08 1080p Bluray", etc.
     """
-    if re.match(r"^Season\s+(\d+)$", name, re.IGNORECASE):
+    if _SEASON_WORD_RE.match(name):
         return True
     if _SEASON_PREFIX_RE.match(name):
         return True
@@ -1293,7 +1297,7 @@ def _is_season_dir(name):
 
 def _season_from_dir(name):
     """Extract season number from a season directory name."""
-    m = re.match(r"^Season\s+(\d+)$", name, re.IGNORECASE)
+    m = _SEASON_WORD_RE.match(name)
     if m:
         return int(m.group(1))
     m = _SEASON_PREFIX_RE.match(name)

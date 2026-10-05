@@ -921,6 +921,26 @@ class TestCreateSymlink:
             mc.TYPE_DIRS.update(orig_type_dirs)
             mc.SOURCE_DIRS = orig_source_dirs
 
+    def test_season_dir_with_saga_suffix(self, tmp_path):
+        """DBZ: 'Dragon Ball Z/Season 3 - Frieza Saga/' is one show, not 7 sagas."""
+        season = tmp_path / "src" / "chill.institute" / "Dragon Ball Z" / "Season 3 - Frieza Saga"
+        season.mkdir(parents=True)
+        video = season / "Dragon Ball Z - S03E01 - The Password.mkv"
+        video.write_text("v")
+
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        orig_type_dirs = mc.TYPE_DIRS.copy()
+        orig_source_dirs = mc.SOURCE_DIRS[:]
+        mc.TYPE_DIRS["tv"] = target
+        mc.SOURCE_DIRS = [str(tmp_path / "src")]
+        try:
+            assert mc.create_symlink(str(video), "tv") is True
+            assert (target / "Dragon Ball Z" / "Season 3" / video.name).is_symlink()
+        finally:
+            mc.TYPE_DIRS.update(orig_type_dirs)
+            mc.SOURCE_DIRS = orig_source_dirs
+
     def test_subs_subdirectory_with_folder_structure(self, tmp_path):
         """Subs/ subdirectory subtitles should land in the show/season folder."""
         show_dir = tmp_path / "My Show"
@@ -1082,6 +1102,14 @@ class TestShowNameNormalization:
         assert mc._year_season_from_dir("Andor (2022)") == (None, None)
         assert mc._container_matches_show("Mythbusters Complete", "Mythbusters")
         assert not mc._container_matches_show("chill.institute", "Breaking Bad")
+
+    def test_season_dir_with_saga_suffix(self):
+        """DBZ-style 'Season 6 - Cell Games Saga' is a season, not a show."""
+        assert mc._is_season_dir("Season 6 - Cell Games Saga")
+        assert mc._season_from_dir("Season 6 - Cell Games Saga") == 6
+        assert mc._is_season_dir("Season 3: Frieza Saga")
+        assert mc._season_from_dir("Season 3: Frieza Saga") == 3
+        assert not mc._is_season_dir("Season 1-5")
 
     def test_canonical_show_dir_reuses_existing(self, tmp_path):
         target = tmp_path / "TV Shows"
