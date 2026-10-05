@@ -1081,11 +1081,19 @@ def _llm_write_paths(show_name, files):
             text = data.get("response", "").strip()
         result = _extract_json(text)
         raw = result.get("paths") or {}
-        paths = {
-            str(k): clean
-            for k, v in raw.items()
-            if (clean := _safe_relative_path(v))
-        }
+        paths = {}
+        for k, v in raw.items():
+            clean = _safe_relative_path(v)
+            if not clean:
+                continue
+            # Force the "<Show> - SxxEyy - ..." prefix to the canonical show
+            # name, so a cache recompute can't emit a case variant that links
+            # the same source twice (e.g. "Mythbusters" vs "MythBusters").
+            p = PurePosixPath(clean)
+            m = re.match(r"^(.*?)( - S\d+.*)$", p.name)
+            if m:
+                p = p.parent / (show_name + m.group(2))
+            paths[str(k)] = str(p)
     except Exception as e:
         print(f"  [WARN] LLM path writer failed: {e}", file=sys.stderr)
         paths = {}

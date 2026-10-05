@@ -515,7 +515,7 @@ class TestLlmPathWriter:
         }
         with mock.patch("urllib.request.urlopen", side_effect=_route_mock(0.97, written)):
             rel = mc._llm_target_relpath("Mythbusters", src)
-        assert rel == "Season 2004/MythBusters - S2004E06 - Best Animal Myths.mkv"
+        assert rel == "Season 2004/Mythbusters - S2004E06 - Best Animal Myths.mkv"
 
     def test_create_symlink_uses_llm_path(self, tmp_path):
         season = tmp_path / "src" / "chill.institute" / "Mythbusters Complete" / "Mythbusters 2004"
@@ -536,7 +536,7 @@ class TestLlmPathWriter:
             with mock.patch("urllib.request.urlopen", side_effect=_route_mock(0.97, written)):
                 assert mc.create_symlink(str(video), "tv") is True
             expected = target / "Mythbusters" / "Season 2004" / \
-                "MythBusters - S2004E06 - Best Animal Myths.mkv"
+                "Mythbusters - S2004E06 - Best Animal Myths.mkv"
             assert expected.is_symlink()
         finally:
             mc.TYPE_DIRS.update(orig_type_dirs)
