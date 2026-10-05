@@ -13,6 +13,9 @@
     categoryOverrides = cfg.categoryOverrides;
     ollamaHost = cfg.ollamaHost;
     ollamaModel = cfg.ollamaModel;
+    jevApiKeyFile = cfg.jevApiKeyFile;
+    jevModel = cfg.jevModel;
+    jevUrl = cfg.jevUrl;
     ffprobePath = "${pkgs.ffmpeg}/bin/ffprobe";
   });
 in {
@@ -71,6 +74,31 @@ in {
       type = lib.types.str;
       default = "qwen3:0.6b";
       description = "Ollama model to use for classification.";
+    };
+
+    jevApiKeyFile = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = ''
+        Path to a file holding the OpenRouter API key for the Jev (TypeSafe
+        System One) classifier arbiter. Empty disables Jev and falls back to
+        the Ollama model. The key is read from the file at runtime, so it never
+        lands in the world-readable Nix store config (point this at an agenix
+        secret). Jev is a typed decision model: it returns one of the category
+        labels with a calibrated confidence instead of generated text.
+      '';
+    };
+
+    jevModel = lib.mkOption {
+      type = lib.types.str;
+      default = "typesafe/jev-1.13";
+      description = "OpenRouter System One model ID for the Jev arbiter.";
+    };
+
+    jevUrl = lib.mkOption {
+      type = lib.types.str;
+      default = "https://openrouter.ai/api/v1/systemone";
+      description = "OpenRouter System One endpoint for the Jev arbiter.";
     };
 
     jellyfinApiKey = lib.mkOption {

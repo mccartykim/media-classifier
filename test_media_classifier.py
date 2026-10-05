@@ -99,6 +99,22 @@ class TestParseFilename:
         assert info["has_tv_pattern"]
         assert "kingdom" in info["cleaned_title"].lower()
 
+    def test_year_season_marker(self):
+        """Year-based season markers (2004x06) must read as TV, not a movie."""
+        info = mc.parse_filename(
+            "chill.institute/Mythbusters Complete/Mythbusters 2004/"
+            "MythBusters - 2004x06 - Best Animal Myths.mkv"
+        )
+        assert info["has_tv_pattern"]
+        assert info["season"] == 2004
+        assert info["episode"] == 6
+
+    def test_year_season_special_marker(self):
+        info = mc.parse_filename("MythBusters - 2016xSpecial 8 - Duct Tape The Return.mkv")
+        assert info["has_tv_pattern"]
+        assert info["season"] == 2016
+        assert int(info["episode"]) == 8
+
 
 # =============================================================================
 # Stage 2: Fast-path classification
@@ -133,6 +149,13 @@ class TestFastPath:
         info = mc.parse_filename("The.Matrix.1999.2160p.UHD.BluRay.mkv")
         media_type, conf = mc.classify_fast_path(info)
         assert media_type == "movie"
+        assert conf == "high"
+
+    def test_year_season_tv(self):
+        """Regression: MythBusters 2004x06 was fast-pathed as a movie."""
+        info = mc.parse_filename("MythBusters - 2004x06 - Best Animal Myths.mkv")
+        media_type, conf = mc.classify_fast_path(info)
+        assert media_type == "tv"
         assert conf == "high"
 
     def test_ambiguous_returns_none(self):
@@ -332,6 +355,108 @@ class TestLLMArbiter:
         with mock.patch("urllib.request.urlopen", side_effect=Exception("connection refused")):
             media_type, conf = mc.classify_llm(info, evidence, {}, [])
             assert media_type is None
+
+
+# =============================================================================
+# Stage 5b: Jev (System One) arbiter (mocked)
+# =============================================================================
+
+class TestJevArbiter:
+    def _mock_openrouter(self, choice, confidence=0.93):
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps({
+            "answers": {
+                "category": {
+                    "type": "choice",
+                    "choice": choice,
+                    "confidence": confidence,
+                    "probabilities": {choice: confidence},
+                }
+            },
+            "usage": {"input_tokens": 100, "output_tokens": 5},
+        }).encode()
+        resp.__enter__ = lambda s: resp
+        resp.__exit__ = mock.MagicMock(return_value=False)
+        return resp
+
+    def test_selects_choice(self, monkeypatch):
+        monkeypatch.setattr(mc, "JEV_API_KEY", "test-key")
+        info = mc.parse_filename("Some.Ambiguous.Thing.mkv")
+        evidence = {
+            "anilist": None,
+            "ffprobe": make_ffprobe_result(duration=2700),
+            "wikipedia": None,
+        }
+        with mock.patch("urllib.request.urlopen", return_value=self._mock_openrouter("tv")):
+            media_type, conf = mc.classify_jev(info, evidence, {}, [])
+        assert media_type == "tv"
+        assert conf == "high"
+
+    def test_missing_key_returns_none(self, monkeypatch):
+        monkeypatch.setattr(mc, "JEV_API_KEY", "")
+        info = mc.parse_filename("X.mkv")
+        media_type, conf = mc.classify_jev(info, {}, {}, [])
+        assert media_type is None
+
+    def test_api_failure_returns_none(self, monkeypatch):
+        monkeypatch.setattr(mc, "JEV_API_KEY", "test-key")
+        info = mc.parse_filename("X.mkv")
+        with mock.patch("urllib.request.urlopen", side_effect=Exception("boom")):
+            media_type, conf = mc.classify_jev(info, {}, {}, [])
+        assert media_type is None
+
+    def test_invalid_choice_returns_none(self, monkeypatch):
+        monkeypatch.setattr(mc, "JEV_API_KEY", "test-key")
+        info = mc.parse_filename("X.mkv")
+        with mock.patch("urllib.request.urlopen", return_value=self._mock_openrouter("bogus")):
+            media_type, conf = mc.classify_jev(info, {}, {}, [])
+        assert media_type is None
+
+    def test_reads_key_from_file(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(mc, "JEV_API_KEY", "")
+        key_file = tmp_path / "openrouter-key"
+        key_file.write_text("sk-or-file-key\n")
+        monkeypatch.setattr(mc, "JEV_API_KEY_FILE", str(key_file))
+        info = mc.parse_filename("X.mkv")
+        with mock.patch(
+            "urllib.request.urlopen", return_value=self._mock_openrouter("movie")
+        ) as mock_urlopen:
+            media_type, conf = mc.classify_jev(info, {}, {}, [])
+        assert media_type == "movie"
+        sent = mock_urlopen.call_args[0][0]
+        assert sent.headers["Authorization"] == "Bearer sk-or-file-key"
+
+    def test_classify_uses_jev_before_ollama(self, monkeypatch, empty_state):
+        monkeypatch.setattr(mc, "JEV_API_KEY", "test-key")
+        monkeypatch.setattr(
+            mc, "gather_evidence",
+            lambda info, fp, st: {"anilist": None, "ffprobe": None, "wikipedia": None},
+        )
+
+        def _boom(*a, **k):
+            raise AssertionError("Ollama must not run when Jev answers")
+
+        monkeypatch.setattr(mc, "classify_llm", _boom)
+        with mock.patch("urllib.request.urlopen", return_value=self._mock_openrouter("tv")):
+            media_type, conf, signals = mc.classify("Kingdom", "/fake/x.mkv", empty_state)
+        assert media_type == "tv"
+        assert signals["method"] == "jev_arbiter"
+
+    def test_jev_overrides_medium_scored(self, monkeypatch, empty_state):
+        monkeypatch.setattr(mc, "JEV_API_KEY", "test-key")
+        monkeypatch.setattr(
+            mc, "gather_evidence",
+            lambda info, fp, st: {"anilist": None, "ffprobe": None, "wikipedia": None},
+        )
+        monkeypatch.setattr(
+            mc, "score_evidence",
+            lambda *a, **k: ("movie", "medium", {"movie": 2.0}, ["weak"]),
+        )
+        with mock.patch("urllib.request.urlopen", return_value=self._mock_openrouter("tv", 0.9)):
+            media_type, conf, signals = mc.classify("Kingdom", "/fake/x.mkv", empty_state)
+        assert media_type == "tv"
+        assert signals["method"] == "jev_arbiter"
+        assert signals["overrode"] == "scored"
 
 
 # =============================================================================
@@ -691,6 +816,27 @@ class TestCreateSymlink:
         finally:
             mc.TYPE_DIRS.update(orig_type_dirs)
 
+    def test_year_season_dir_groups_under_show(self, tmp_path):
+        """A pack's year dirs (Mythbusters 2004) are seasons, not show names."""
+        season_dir = tmp_path / "chill.institute" / "Mythbusters Complete" / "Mythbusters 2004"
+        season_dir.mkdir(parents=True)
+        video = season_dir / "MythBusters - 2004x06 - Best Animal Myths.mkv"
+        video.write_text("video")
+
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        orig_type_dirs = mc.TYPE_DIRS.copy()
+        orig_source_dirs = mc.SOURCE_DIRS[:]
+        mc.TYPE_DIRS["tv"] = target
+        mc.SOURCE_DIRS = [str(tmp_path)]
+        try:
+            result = mc.create_symlink(str(video), "tv")
+            assert result is True
+            assert (target / "Mythbusters" / "Season 2004" / video.name).is_symlink()
+        finally:
+            mc.TYPE_DIRS.update(orig_type_dirs)
+            mc.SOURCE_DIRS = orig_source_dirs
+
     def test_subs_subdirectory_with_folder_structure(self, tmp_path):
         """Subs/ subdirectory subtitles should land in the show/season folder."""
         show_dir = tmp_path / "My Show"
@@ -845,6 +991,13 @@ class TestShowNameNormalization:
             mc._normalize_show_key("Star Trek The Next Generation")
         assert mc._normalize_show_key("Better Call Saul") == \
             mc._normalize_show_key("BCS")
+
+    def test_year_season_dir_detection(self):
+        """Bare trailing-year dirs are seasons; parenthesized years are not."""
+        assert mc._year_season_from_dir("Mythbusters 2004") == ("Mythbusters", 2004)
+        assert mc._year_season_from_dir("Andor (2022)") == (None, None)
+        assert mc._container_matches_show("Mythbusters Complete", "Mythbusters")
+        assert not mc._container_matches_show("chill.institute", "Breaking Bad")
 
     def test_canonical_show_dir_reuses_existing(self, tmp_path):
         target = tmp_path / "TV Shows"

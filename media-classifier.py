@@ -43,6 +43,18 @@ FFPROBE_PATH = os.environ.get("FFPROBE_PATH", "ffprobe")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:0.6b")
 
+# Jev (TypeSafe System One) arbiter, reached through OpenRouter. A typed
+# decision model rather than a chat LLM: the reply is constrained to our
+# choice labels, so there is no JSON to parse and no way to get an invalid
+# category back. Enabled only when an OpenRouter key is present.
+JEV_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+JEV_API_KEY_FILE = os.environ.get("JEV_API_KEY_FILE", "").strip()
+JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")
+JEV_URL = os.environ.get(
+    "JEV_URL", "https://openrouter.ai/api/v1/systemone"
+)
+JEV_TIMEOUT = float(os.environ.get("JEV_TIMEOUT", "20"))
+
 CLASSIFIER_VERSION = 2
 CACHE_TTL_DAYS = 30
 
@@ -104,18 +116,28 @@ TV_EPISODE_RE = re.compile(r"(?:^|[.\s/])S\d{1,2}E\d{1,3}", re.IGNORECASE)
 TV_SEASON_RE = re.compile(r"(?:^|[.\s/])S\d{1,2}(?:[.\s/]|$)", re.IGNORECASE)
 TV_SEASON_WORD_RE = re.compile(r"(?:^|[.\s/])Season[.\s]\d{1,2}", re.IGNORECASE)
 TV_XN_RE = re.compile(r"(?:^|[.\s/])\d{1,2}x\d{2}", re.IGNORECASE)
+# Year-based season numbering, common in reality/documentary packs:
+# "MythBusters - 2004x06 - ...". The season is a 4-digit air year (unlike
+# TV_XN_RE's 1-2 digit season), and some packs append a "Special" marker
+# ("2016xSpecial 8"). Match the year + optional "Special" + episode number.
+TV_YEAR_XN_RE = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})x(?:special\s*)?(\d{1,3})(?!\d)", re.IGNORECASE
+)
 MOVIE_YEAR_RE = re.compile(r"[.\s(](?:19|20)\d{2}[.\s)]")
 CRC_RE = re.compile(r"\[[\dA-Fa-f]{8}\]")
 BRACKET_PREFIX_RE = re.compile(r"^\[(.+?)\]\s")
 
 
 def has_tv_pattern(name):
-    return any(p.search(name) for p in [TV_EPISODE_RE, TV_SEASON_RE, TV_SEASON_WORD_RE, TV_XN_RE])
+    return any(
+        p.search(name)
+        for p in [TV_EPISODE_RE, TV_SEASON_RE, TV_SEASON_WORD_RE, TV_XN_RE, TV_YEAR_XN_RE]
+    )
 
 
 def load_config(config_path):
     """Load JSON config file and apply settings to globals."""
-    global SOURCE_DIRS, MEDIA_BASE, TYPE_DIRS, OLLAMA_HOST, OLLAMA_MODEL, FFPROBE_PATH, SHOW_ALIASES, CATEGORY_OVERRIDES
+    global SOURCE_DIRS, MEDIA_BASE, TYPE_DIRS, OLLAMA_HOST, OLLAMA_MODEL, FFPROBE_PATH, SHOW_ALIASES, CATEGORY_OVERRIDES, JEV_API_KEY, JEV_API_KEY_FILE, JEV_MODEL, JEV_URL
 
     with open(config_path) as f:
         cfg = json.load(f)
@@ -138,6 +160,14 @@ def load_config(config_path):
         OLLAMA_MODEL = cfg["ollamaModel"]
     if "ffprobePath" in cfg:
         FFPROBE_PATH = cfg["ffprobePath"]
+    if "jevApiKey" in cfg:
+        JEV_API_KEY = str(cfg["jevApiKey"]).strip()
+    if "jevApiKeyFile" in cfg:
+        JEV_API_KEY_FILE = str(cfg["jevApiKeyFile"]).strip()
+    if "jevModel" in cfg:
+        JEV_MODEL = cfg["jevModel"]
+    if "jevUrl" in cfg:
+        JEV_URL = cfg["jevUrl"]
     if "showAliases" in cfg:
         SHOW_ALIASES = dict(cfg["showAliases"])
     if "categoryOverrides" in cfg:
@@ -267,6 +297,17 @@ def parse_filename(name):
             info["release_group"] = info["release_group"] or parsed.get("release_group")
         except Exception:
             pass
+
+    # Year-based season/episode markers (e.g. "2004x06", "2016xSpecial 8").
+    # anitopy does not decode these; record them so the TV fast-path and the
+    # season-folder inference have something to work with. Don't clobber an
+    # explicit SxxEyy that anitopy already found.
+    yxm = TV_YEAR_XN_RE.search(full_path)
+    if yxm:
+        if info["season"] is None:
+            info["season"] = int(yxm.group(1))
+        if info["episode"] is None:
+            info["episode"] = int(yxm.group(2))
 
     # Regex fallback for title extraction
     if not info["cleaned_title"]:
@@ -751,6 +792,133 @@ def classify_llm(info, evidence, scores, reasons):
 
 
 # =============================================================================
+# Stage 5b: Jev (System One) arbiter via OpenRouter
+# =============================================================================
+
+
+def _jev_api_key():
+    """Resolve the OpenRouter key from the environment or a bare key file.
+
+    JEV_API_KEY_FILE lets systemd/agenix hand us a root-readable secret path
+    (the same pattern as the Jellyfin key) without embedding the secret in the
+    world-readable Nix store config.
+    """
+    global JEV_API_KEY
+    if JEV_API_KEY:
+        return JEV_API_KEY
+    if JEV_API_KEY_FILE:
+        try:
+            JEV_API_KEY = Path(JEV_API_KEY_FILE).read_text().strip()
+        except OSError as e:
+            print(f"  [WARN] Could not read JEV_API_KEY_FILE: {e}", file=sys.stderr)
+            JEV_API_KEY = ""
+    return JEV_API_KEY
+
+
+def _jev_state(info, evidence):
+    """Compact, decision-relevant state handed to the Jev classifier.
+
+    Only what the model benefits from: parsed filename signals plus the cheap
+    ffprobe context (duration, audio/subtitle languages) and, when the pipeline
+    already fetched it, a one-line AniList hint.
+    """
+    state = {
+        "path": info.get("original"),
+        "parsed_title": info.get("cleaned_title"),
+        "year": info.get("year"),
+        "season": info.get("season"),
+        "episode": info.get("episode"),
+        "looks_episodic": bool(info.get("has_tv_pattern")),
+        "release_group": info.get("release_group") or info.get("bracket_group"),
+        "has_crc": bool(info.get("has_crc")),
+    }
+
+    ffprobe = evidence.get("ffprobe") or {}
+    if ffprobe:
+        state["duration_seconds"] = ffprobe.get("duration")
+        if ffprobe.get("audio_langs"):
+            state["audio_languages"] = ffprobe["audio_langs"]
+        if ffprobe.get("sub_formats"):
+            state["subtitle_formats"] = ffprobe["sub_formats"]
+
+    anilist = evidence.get("anilist")
+    if anilist:
+        top = anilist[0] or {}
+        titles = top.get("title", {})
+        state["anilist_match"] = {
+            "title": titles.get("english") or titles.get("romaji"),
+            "country": top.get("countryOfOrigin"),
+            "format": top.get("format"),
+            "episodes": top.get("episodes"),
+            "popularity": top.get("popularity"),
+        }
+
+    return state
+
+
+def classify_jev(info, evidence, scores, reasons):
+    """Arbitrate anime/tv/movie with OpenRouter's System One (Jev) model.
+
+    Returns (category, confidence) where confidence is "high" when Jev's own
+    confidence is >= 0.8, else "medium"; or (None, None) when no key is
+    configured, the reply is malformed, or the call fails (callers fall back
+    to the Ollama arbiter / scored result).
+    """
+    api_key = _jev_api_key()
+    if not api_key:
+        return None, None
+
+    payload = json.dumps({
+        "model": JEV_MODEL,
+        "state": _jev_state(info, evidence),
+        "questions": {
+            "category": {
+                "type": "choice",
+                "instructions": (
+                    "Decide which Jellyfin library this video belongs in. "
+                    "anime: Japanese-animated series or films. "
+                    "tv: live-action episodic television, reality, "
+                    "documentary, talk, or anthology series. "
+                    "movie: a standalone feature film."
+                ),
+                "criteria": {
+                    "anime": "Japanese-animated series or film",
+                    "tv": "Live-action episodic series, reality or documentary",
+                    "movie": "Standalone feature film",
+                },
+            }
+        },
+    }).encode()
+
+    req = urllib.request.Request(
+        JEV_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "https://github.com/mccartykim/media-classifier",
+            "X-Title": "media-classifier",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=JEV_TIMEOUT) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        print(f"  [WARN] Jev arbiter failed: {e}", file=sys.stderr)
+        return None, None
+
+    answer = (data.get("answers") or {}).get("category") or {}
+    category = str(answer.get("choice", "")).lower()
+    if category not in TYPE_DIRS:
+        return None, None
+
+    confidence = answer.get("confidence")
+    if isinstance(confidence, (int, float)) and confidence >= 0.8:
+        return category, "high"
+    return category, "medium"
+
+
+# =============================================================================
 # Pipeline orchestration
 # =============================================================================
 
@@ -806,9 +974,29 @@ def classify(name, filepath, state):
             signals["ffprobe_lang"] = ffprobe.get("audio_langs", [])
             signals["ffprobe_subs"] = ffprobe.get("sub_formats", [])
         signals["anilist"] = bool(evidence.get("anilist"))
+        # A typed Jev decision overrides a merely-medium scored result (the
+        # scorer is the component this project has mis-trusted); high-confidence
+        # scored results and structural fast-path results are trusted as-is.
+        if _jev_api_key() and confidence != "high":
+            jev_type, jev_conf = classify_jev(info, evidence, scores, reasons)
+            if jev_type:
+                signals["method"] = "jev_arbiter"
+                signals["model"] = JEV_MODEL
+                signals["overrode"] = "scored"
+                return jev_type, jev_conf, signals
         return media_type, confidence, signals
 
-    # Stage 5: LLM arbiter
+    # Stage 5: Arbiter. Jev first (typed, calibrated), then the Ollama LLM.
+    if _jev_api_key():
+        media_type, confidence = classify_jev(info, evidence, scores, reasons)
+        if media_type:
+            return media_type, confidence, {
+                "method": "jev_arbiter",
+                "model": JEV_MODEL,
+                "scores": scores,
+                "reasons": reasons,
+            }
+
     media_type, confidence = classify_llm(info, evidence, scores, reasons)
     if media_type:
         signals = {
@@ -876,6 +1064,34 @@ def _season_from_dir(name):
     return None
 
 
+# A season directory named by air year, e.g. "Mythbusters 2004". The trailing
+# year must be bare (not parenthesized) so show dirs like "Andor (2022)" are
+# not mistaken for seasons.
+_YEAR_SEASON_DIR_RE = re.compile(r"^(?P<show>.+?)[\s._-]+(?P<year>(?:19|20)\d{2})$")
+
+
+def _year_season_from_dir(name):
+    """Return (show_hint, year) if `name` is a bare trailing-year season dir."""
+    m = _YEAR_SEASON_DIR_RE.match(name)
+    if not m:
+        return None, None
+    return m.group("show").strip(), int(m.group("year"))
+
+
+def _container_matches_show(container, show_hint):
+    """True when `container` plausibly names the same show as `show_hint`.
+
+    Guards the year-season rule against a top-level show dir like
+    "Breaking Bad 2008" whose parent is a source/import folder
+    ("chill.institute") rather than a pack container ("Mythbusters Complete").
+    """
+    ck = _normalize_show_key(container)
+    sk = _normalize_show_key(show_hint)
+    if not ck or not sk:
+        return False
+    return ck == sk or sk in ck or ck in sk
+
+
 def _infer_show_folder(source):
     """Infer show name and season from the source file's directory structure.
 
@@ -913,6 +1129,23 @@ def _infer_show_folder(source):
             # Return None for season to skip these files (they're extras)
             return None, None
         return None, None
+
+    # Year-form season dir ("Mythbusters 2004") inside a pack/show container
+    # ("Mythbusters Complete"). The container is the show; the year is the
+    # season. Only applies when the container isn't the source root, so a lone
+    # "<name> <year>" folder at the top level is still treated as a show.
+    _yseason_show, _yseason_year = _year_season_from_dir(parent_name)
+    if _yseason_year is not None:
+        grandparent = parent.parent
+        gp_name = grandparent.name
+        if (
+            gp_name
+            and gp_name not in source_root_names
+            and _container_matches_show(gp_name, _yseason_show)
+        ):
+            container_show = _clean_show_name(gp_name)
+            if container_show:
+                return container_show, _yseason_year
 
     # Skip if parent is a source root directory (e.g., "chill.institute", "Parsimony")
     if parent_name in source_root_names:
@@ -986,6 +1219,14 @@ def _clean_show_name(name):
     cleaned = re.sub(r"\s*\[.*?\]\s*$", "", cleaned).strip()
     # Remove trailing dots/dashes
     cleaned = cleaned.rstrip(".-_ ")
+    # Strip trailing pack descriptors ("... Complete", "... Complete Series",
+    # "... Seasons 1 to 23") that release packs append to the show title.
+    cleaned = re.sub(
+        r"\s+(?:complete(?:\s+series)?|seasons?\s+\d[\d\s]*?(?:to|-)\s*\d+)\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
 
     return cleaned if cleaned else name
 
