@@ -173,8 +173,11 @@ in {
         ExecStart = "${cfg.package}/bin/media-classifier --config ${configFile}";
       } // lib.optionalAttrs (cfg.jellyfinApiKey != "") {
         ExecStartPost = pkgs.writeShellScript "trigger-jellyfin-scan" ''
+          # Jellyfin requires the key in the MediaBrowser Authorization header;
+          # the `?api_key=` query form returns 401 for admin endpoints.
           ${pkgs.curl}/bin/curl -sf -X POST \
-            "${cfg.jellyfinUrl}/Library/Refresh?api_key=${cfg.jellyfinApiKey}" \
+            -H "Authorization: MediaBrowser Token=\"${cfg.jellyfinApiKey}\"" \
+            "${cfg.jellyfinUrl}/Library/Refresh" \
             || echo "Warning: Jellyfin scan trigger failed (non-fatal)"
         '';
       };
