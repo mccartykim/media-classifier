@@ -460,6 +460,90 @@ class TestJevArbiter:
 
 
 # =============================================================================
+# Nonstandard-layout path writer (Jev noul gate + Ollama)
+# =============================================================================
+
+def _route_mock(jev_noul=0.95, ollama_paths=None):
+    """urlopen side_effect that serves Jev and Ollama from their URLs."""
+    def _side_effect(req, *a, **k):
+        url = getattr(req, "full_url", str(req))
+        resp = mock.MagicMock()
+        if "systemone" in url:
+            body = {"answers": {"yes": {"type": "noul", "noul": jev_noul}}}
+        else:
+            body = {"response": json.dumps({"paths": ollama_paths or {}})}
+        resp.read.return_value = json.dumps(body).encode()
+        resp.__enter__ = lambda s: resp
+        resp.__exit__ = mock.MagicMock(return_value=False)
+        return resp
+    return _side_effect
+
+
+class TestLlmPathWriter:
+    @pytest.fixture(autouse=True)
+    def _isolate(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mc, "JEV_API_KEY", "test-key")
+        monkeypatch.setattr(mc, "LLM_PATH_CACHE_FILE", tmp_path / "llm_path_cache.json")
+        mc._nonstandard_cache.clear()
+        yield
+        mc._nonstandard_cache.clear()
+
+    def test_no_key_returns_none(self, monkeypatch):
+        monkeypatch.setattr(mc, "JEV_API_KEY", "")
+        assert mc._llm_target_relpath("Show", Path("/tmp/nope/file.mkv")) is None
+
+    def test_safe_relative_path_rejects_escape(self):
+        assert mc._safe_relative_path("Season 1/Show - S01E01 - X.mkv") == \
+            "Season 1/Show - S01E01 - X.mkv"
+        assert mc._safe_relative_path("../evil.mkv") is None
+        assert mc._safe_relative_path("/abs/evil.mkv") is None
+
+    def test_standard_layout_skips_llm(self, tmp_path):
+        d = tmp_path / "Show" / "Season 1"
+        d.mkdir(parents=True)
+        (d / "Show - S01E01 - Pilot.mkv").write_text("v")
+        with mock.patch("urllib.request.urlopen", side_effect=_route_mock(jev_noul=0.05)):
+            assert mc._llm_target_relpath("Show", d / "Show - S01E01 - Pilot.mkv") is None
+
+    def test_nonstandard_layout_writes_path(self, tmp_path):
+        d = tmp_path / "Mythbusters Complete" / "Mythbusters 2004"
+        d.mkdir(parents=True)
+        src = d / "MythBusters - 2004x06 - Best Animal Myths.mkv"
+        src.write_text("v")
+        written = {
+            src.name: "Season 2004/MythBusters - S2004E06 - Best Animal Myths.mkv"
+        }
+        with mock.patch("urllib.request.urlopen", side_effect=_route_mock(0.97, written)):
+            rel = mc._llm_target_relpath("Mythbusters", src)
+        assert rel == "Season 2004/MythBusters - S2004E06 - Best Animal Myths.mkv"
+
+    def test_create_symlink_uses_llm_path(self, tmp_path):
+        season = tmp_path / "src" / "chill.institute" / "Mythbusters Complete" / "Mythbusters 2004"
+        season.mkdir(parents=True)
+        video = season / "MythBusters - 2004x06 - Best Animal Myths.mkv"
+        video.write_text("v")
+
+        target = tmp_path / "TV Shows"
+        target.mkdir()
+        written = {
+            video.name: "Season 2004/MythBusters - S2004E06 - Best Animal Myths.mkv"
+        }
+        orig_type_dirs = mc.TYPE_DIRS.copy()
+        orig_source_dirs = mc.SOURCE_DIRS[:]
+        mc.TYPE_DIRS["tv"] = target
+        mc.SOURCE_DIRS = [str(tmp_path / "src")]
+        try:
+            with mock.patch("urllib.request.urlopen", side_effect=_route_mock(0.97, written)):
+                assert mc.create_symlink(str(video), "tv") is True
+            expected = target / "Mythbusters" / "Season 2004" / \
+                "MythBusters - S2004E06 - Best Animal Myths.mkv"
+            assert expected.is_symlink()
+        finally:
+            mc.TYPE_DIRS.update(orig_type_dirs)
+            mc.SOURCE_DIRS = orig_source_dirs
+
+
+# =============================================================================
 # Full pipeline (mocked)
 # =============================================================================
 

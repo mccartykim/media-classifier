@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 try:
     from rapidfuzz import fuzz as rf_fuzz
@@ -59,6 +59,10 @@ CLASSIFIER_VERSION = 2
 CACHE_TTL_DAYS = 30
 
 LLM_SHOW_CACHE_FILE = STATE_DIR / "llm_show_cache.json"
+LLM_PATH_CACHE_FILE = STATE_DIR / "llm_path_cache.json"
+# In-run memo of the Jev "is this show's layout nonstandard?" answer, so a
+# 272-file show asks Jev once instead of once per file.
+_nonstandard_cache = {}
 NEEDS_CLASSIFY_REVIEW_LOG = STATE_DIR / "needs-classify-review.log"
 _llm_show_lock = threading.Lock()
 
@@ -916,6 +920,223 @@ def classify_jev(info, evidence, scores, reasons):
     if isinstance(confidence, (int, float)) and confidence >= 0.8:
         return category, "high"
     return category, "medium"
+
+
+# =============================================================================
+# Nonstandard-layout path writer (Jev noul gate + Ollama chat model)
+# =============================================================================
+
+
+def _jev_noul(instructions, state):
+    """Ask Jev a yes/no (noul) question. Returns P(yes) in [0,1], or None."""
+    api_key = _jev_api_key()
+    if not api_key:
+        return None
+
+    payload = json.dumps({
+        "model": JEV_MODEL,
+        "state": state,
+        "questions": {"yes": {"type": "noul", "instructions": instructions}},
+    }).encode()
+    req = urllib.request.Request(
+        JEV_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "https://github.com/mccartykim/media-classifier",
+            "X-Title": "media-classifier",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=JEV_TIMEOUT) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        print(f"  [WARN] Jev noul failed: {e}", file=sys.stderr)
+        return None
+
+    answer = (data.get("answers") or {}).get("yes") or {}
+    try:
+        return float(answer.get("noul"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_llm_path_cache():
+    try:
+        if LLM_PATH_CACHE_FILE.exists():
+            with open(LLM_PATH_CACHE_FILE) as f:
+                return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def _save_llm_path_cache(cache):
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LLM_PATH_CACHE_FILE, "w") as f:
+            json.dump(cache, f, indent=2)
+    except OSError:
+        pass
+
+
+def _safe_relative_path(rel):
+    """Reject absolute/escaping paths from the model; return a clean str or None."""
+    if not rel:
+        return None
+    p = PurePosixPath(str(rel).replace("\\", "/"))
+    if p.is_absolute() or any(part in ("", "..") for part in p.parts):
+        return None
+    return str(p)
+
+
+def _extract_json(text):
+    """Parse JSON from a model reply that may be fenced or padded with prose."""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(text[start:end + 1])
+    raise json.JSONDecodeError("no JSON object found", text, 0)
+
+
+def _dir_media_files(directory):
+    """Media files directly in `directory` (one season dir, not recursive)."""
+    out = []
+    try:
+        for f in sorted(directory.iterdir()):
+            if f.is_file() and f.suffix.lower() in MEDIA_EXTENSIONS:
+                out.append(f)
+    except OSError:
+        pass
+    return out
+
+
+def _llm_write_paths(show_name, files):
+    """Ask the Ollama chat model to write Jellyfin-relative paths for `files`.
+
+    `files` is a list of source Paths (one season/pack directory). Returns
+    {source_name: "Season N/Show - SxxEyy - Title.ext"} relative to the show
+    folder, or {} on failure. Cached by show + sorted file names so repeat
+    classifier runs (and the already-processed path) don't re-bill the model.
+    """
+    names = sorted(f.name for f in files)
+    key = f"{_normalize_show_key(show_name)}|{'|'.join(names)}"
+    cache = _load_llm_path_cache()
+    if key in cache:
+        return cache[key]
+
+    listing = []
+    for f in files:
+        info = parse_filename(f.name)
+        listing.append(
+            f"- {f.name} (parsed title={info.get('cleaned_title')!r}, "
+            f"season={info.get('season')}, episode={info.get('episode')})"
+        )
+
+    prompt = (
+        f"You are organizing the TV show {show_name!r} for a Jellyfin library.\n"
+        "For each file below, write a Jellyfin-friendly path RELATIVE TO THE SHOW "
+        "DIRECTORY, in this exact shape:\n"
+        "  Season <season>/<Show name> - S<season>E<episode> - <Episode title>.<ext>\n"
+        "Take the episode title from the filename (the text after the season/episode "
+        "marker). Keep the season and episode numbers the filename encodes; do NOT "
+        "renumber them (e.g. '2004x06' becomes season 2004 episode 6 -> S2004E06). "
+        "If a number is missing, infer the best value from the filename. Never invent "
+        "titles. Return ONLY JSON of the form "
+        '{"paths": {"<input filename>": "<relative path>"}}.\n\n'
+        f"Files:\n{chr(10).join(listing)}\n/no_think"
+    )
+
+    payload = json.dumps({
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "think": False,
+        "format": "json",
+        "options": {"temperature": 0.1, "num_predict": 4096},
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read())
+            text = data.get("response", "").strip()
+        result = _extract_json(text)
+        raw = result.get("paths") or {}
+        paths = {
+            str(k): clean
+            for k, v in raw.items()
+            if (clean := _safe_relative_path(v))
+        }
+    except Exception as e:
+        print(f"  [WARN] LLM path writer failed: {e}", file=sys.stderr)
+        paths = {}
+
+    cache[key] = paths
+    _save_llm_path_cache(cache)
+    return paths
+
+
+def _llm_target_relpath(show_name, source):
+    """Return an LLM-written path for `source` (relative to the show dir), or None.
+
+    Gate: Jev answers a noul question about whether the show's on-disk layout is
+    nonstandard. Only then do we spend a chat-model call to write paths.
+    """
+    if not _jev_api_key():
+        return None
+
+    cache_key = _normalize_show_key(show_name)
+    if cache_key in _nonstandard_cache:
+        p = _nonstandard_cache[cache_key]
+    else:
+        disk_key = f"noul|{cache_key}"
+        disk_cache = _load_llm_path_cache()
+        if disk_cache.get(disk_key) is not None:
+            p = disk_cache[disk_key]
+        else:
+            files_in_dir = _dir_media_files(source.parent)
+            sample = [f.name for f in files_in_dir][:20]
+            parsed = parse_filename(source.name)
+            p = _jev_noul(
+                "This TV/anime show's files use a nonstandard season/episode layout. "
+                "The containing folder and filenames are given as state. Does the "
+                "layout differ from the common 'Season 1/Show - S01E01 - Title' form "
+                "(for example year-based seasons like 'Season 2004', filenames like "
+                "'Show - 2004x06 - Title', 'xSpecial', or mixed numbering)?",
+                {
+                    "show": show_name,
+                    "folder": source.parent.name,
+                    "parsed_season": parsed.get("season"),
+                    "parsed_episode": parsed.get("episode"),
+                    "files": sample,
+                },
+            )
+            if p is not None:
+                disk_cache[disk_key] = p
+                _save_llm_path_cache(disk_cache)
+        _nonstandard_cache[cache_key] = p
+
+    if p is None or p < 0.6:
+        return None
+
+    files = _dir_media_files(source.parent)
+    if not files:
+        return None
+    paths = _llm_write_paths(show_name, files)
+    return paths.get(source.name)
 
 
 # =============================================================================
@@ -2404,18 +2625,28 @@ def create_symlink(source, media_type):
         if show_name:
             show_name = _canonical_show_dir(target_dir, show_name)
             show_dir = target_dir / show_name
-            if season_num is not None:
-                dest_dir = show_dir / f"Season {season_num}"
+            # Nonstandard layout: a Jev noul gate lets an Ollama chat model
+            # write the Jellyfin-relative path (season dir + SxxEyy + title),
+            # so the episode title survives into Jellyfin instead of being lost.
+            llm_rel = _llm_target_relpath(show_name, source)
+            if llm_rel:
+                link_path = show_dir / llm_rel
+                dest_dir = link_path.parent
+                dest_dir.mkdir(parents=True, exist_ok=True)
             else:
-                dest_dir = show_dir
-            dest_dir.mkdir(parents=True, exist_ok=True)
+                if season_num is not None:
+                    dest_dir = show_dir / f"Season {season_num}"
+                else:
+                    dest_dir = show_dir
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                link_path = dest_dir / source.name
         else:
             # Can't determine show folder — skip rather than dump flat
             return False
     else:
         dest_dir = target_dir
+        link_path = dest_dir / source.name
 
-    link_path = dest_dir / source.name
     created = False
 
     if not link_path.exists() and not link_path.is_symlink():
@@ -2430,22 +2661,29 @@ def create_symlink(source, media_type):
 
     # Symlink companion subtitle files
     # Always check even if video link already existed — subtitles may have arrived later
-    _link_companion_subs(source, dest_dir, media_type, created)
+    _link_companion_subs(source, dest_dir, media_type, created, target_stem=link_path.stem)
 
     return created
 
 
-def _link_companion_subs(source, target_dir, media_type, created_ref):
+def _link_companion_subs(source, target_dir, media_type, created_ref, target_stem=None):
     """Find and symlink subtitle files for a video.
+
+    `target_stem` is the video's target filename stem (it may differ from the
+    source stem when the LLM path writer renamed the link); subtitles are named
+    to match it.
 
     Searches two patterns:
     1. Same directory, matching stem (e.g., Movie.Name.srt alongside Movie.Name.mkv)
     2. Subs/ subdirectory with episode-matching folder (e.g., Subs/Show.S01E01/2_English.srt)
     """
+    target_stem = target_stem or source.stem
+
     # Pattern 1: Same directory, matching stem
     for sub_file in source.parent.iterdir():
         if sub_file.suffix.lower() in SUBTITLE_EXTENSIONS and sub_file.stem.startswith(source.stem):
-            sub_link = target_dir / sub_file.name
+            suffix = sub_file.name[len(source.stem):]
+            sub_link = target_dir / f"{target_stem}{suffix}"
             if not sub_link.exists() and not sub_link.is_symlink():
                 try:
                     sub_link.symlink_to(sub_file)
@@ -2468,7 +2706,7 @@ def _link_companion_subs(source, target_dir, media_type, created_ref):
             if sub_file.suffix.lower() in SUBTITLE_EXTENSIONS:
                 # Rename to match video: VideoName.lang.srt
                 lang = sub_file.stem.split("_", 1)[-1] if "_" in sub_file.stem else "en"
-                sub_name = f"{source.stem}.{lang}{sub_file.suffix}"
+                sub_name = f"{target_stem}.{lang}{sub_file.suffix}"
                 sub_link = target_dir / sub_name
                 if not sub_link.exists() and not sub_link.is_symlink():
                     try:
