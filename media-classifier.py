@@ -60,6 +60,8 @@ CACHE_TTL_DAYS = 30
 
 LLM_SHOW_CACHE_FILE = STATE_DIR / "llm_show_cache.json"
 LLM_PATH_CACHE_FILE = STATE_DIR / "llm_path_cache.json"
+# Bump when the path-writer prompt changes so stale mappings are recomputed.
+PATH_WRITER_VERSION = 2
 # In-run memo of the Jev "is this show's layout nonstandard?" answer, so a
 # 272-file show asks Jev once instead of once per file.
 _nonstandard_cache = {}
@@ -1029,7 +1031,7 @@ def _llm_write_paths(show_name, files):
     classifier runs (and the already-processed path) don't re-bill the model.
     """
     names = sorted(f.name for f in files)
-    key = f"{_normalize_show_key(show_name)}|{'|'.join(names)}"
+    key = f"v{PATH_WRITER_VERSION}|{_normalize_show_key(show_name)}|{'|'.join(names)}"
     cache = _load_llm_path_cache()
     if key in cache:
         return cache[key]
@@ -1050,6 +1052,10 @@ def _llm_write_paths(show_name, files):
         "Take the episode title from the filename (the text after the season/episode "
         "marker). Keep the season and episode numbers the filename encodes; do NOT "
         "renumber them (e.g. '2004x06' becomes season 2004 episode 6 -> S2004E06). "
+        "A file whose name marks it as a Special (e.g. '2016xSpecial 8') is a "
+        "special: put it in Season 0 as S00E<number> (-> 'Season 0/Show - S00E08 - X'). "
+        "Every file must get a distinct season/episode pair; never assign two files "
+        "the same SxxEyy. "
         "If a number is missing, infer the best value from the filename. Never invent "
         "titles. Return ONLY JSON of the form "
         '{"paths": {"<input filename>": "<relative path>"}}.\n\n'
